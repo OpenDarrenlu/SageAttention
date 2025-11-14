@@ -1,0 +1,3 @@
+[submodule "3rd_party/diffusers"]
+	path = 3rd_party/diffusers
+	url = https://github.com/huggingface/diffusers.git

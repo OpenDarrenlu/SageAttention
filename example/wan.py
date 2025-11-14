@@ -27,7 +27,7 @@ prompt = "A serene night scene in a forested area. The first frame shows a tranq
 torch.manual_seed(42)
 
 # Available models: Wan-AI/Wan2.1-I2V-14B-720P-Diffusers or Wan-AI/Wan2.1-I2V-14B-480P-Diffusers
-model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+model_id = "../../Wan2.1-T2V-1.3B-Diffusers"
 
 pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 # pipe.enable_model_cpu_offload()

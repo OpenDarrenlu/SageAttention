@@ -89,3 +89,30 @@ def set_sage_attn_wan(
     for idx, block in enumerate(model.blocks):
         processor = WanAttnProcessor2_0(attn_func)
         block.attn1.processor = processor
+
+if __name__ == "__main__":
+    # test WanAttnProcessor2_0 with a dummy WanTransformer3DModel
+    from diffusers import WanTransformer3DModel
+    model = WanTransformer3DModel(
+        in_channels=4,
+        out_channels=4,
+        attention_head_dim=8,
+        num_attention_heads=8,
+        num_layers=2
+    )
+    set_sage_attn_wan(model, F.scaled_dot_product_attention)
+    x = torch.randn(1, 4, 4, 64, 64)
+    encoder_hidden_states = torch.randn(1, 257 + 16, 4096)
+    timestep = torch.randint(0, 1000, (1,))
+    output = model(
+        hidden_states=x,
+        encoder_hidden_states=encoder_hidden_states,
+        timestep=timestep
+    )[0]
+    print(output.shape)  # should be [1, 4, 4, 64, 64]
+    assert output.shape == x.shape
+    print("WanAttnProcessor2_0 test passed.")
+    # test sage attention and compare with original attention
+    out_sage = model(x, encoder_hidden_states=encoder_hidden_states, timestep=timestep)[0]
+    assert torch.allclose(output, out_sage)
+    print("Sage attention test passed.")
