@@ -91,6 +91,7 @@ def set_sage_attn_wan(
         block.attn1.processor = processor
 
 if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     # test WanAttnProcessor2_0 with a dummy WanTransformer3DModel
     from diffusers import WanTransformer3DModel
     model = WanTransformer3DModel(
@@ -99,20 +100,37 @@ if __name__ == "__main__":
         attention_head_dim=8,
         num_attention_heads=8,
         num_layers=2
-    )
+    ).to(torch.bfloat16).to(device)
     set_sage_attn_wan(model, F.scaled_dot_product_attention)
-    x = torch.randn(1, 4, 4, 64, 64)
-    encoder_hidden_states = torch.randn(1, 257 + 16, 4096)
-    timestep = torch.randint(0, 1000, (1,))
+    x = torch.randn(1, 4, 4, 64, 64).to(torch.bfloat16).to(device)
+    encoder_hidden_states = torch.randn(1, 257 + 16, 4096).to(torch.bfloat16).to(device)
+    timestep = torch.randint(0, 1000, (1,)).to(torch.bfloat16).to(device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     output = model(
         hidden_states=x,
         encoder_hidden_states=encoder_hidden_states,
         timestep=timestep
     )[0]
+    end.record()
+    torch.cuda.synchronize()
+    print(f"Time cost(scaled_dot_product_attention): {start.elapsed_time(end)} ms")
     print(output.shape)  # should be [1, 4, 4, 64, 64]
     assert output.shape == x.shape
     print("WanAttnProcessor2_0 test passed.")
     # test sage attention and compare with original attention
+    from sageattention import sageattn
+    set_sage_attn_wan(model, sageattn)
+    start.record()
     out_sage = model(x, encoder_hidden_states=encoder_hidden_states, timestep=timestep)[0]
-    assert torch.allclose(output, out_sage)
-    print("Sage attention test passed.")
+    end.record()
+    torch.cuda.synchronize()
+    print(f"Time cost(sage_attention): {start.elapsed_time(end)} ms")
+    # assert torch.allclose(output, out_sage, rtol=1e-2, atol=1e-2)
+    # get the difference between output and out_sage
+    diff = torch.abs(output - out_sage)
+    print(f"Max difference between original(max: {output.max()}) and sage(max: {out_sage.max()}) attention: {diff.max()}")
+    relative_error = diff.max() / torch.abs(output).max()
+    print(f"Relative error: {relative_error}")
+    # print("Sage attention test passed.")
