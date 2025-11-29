@@ -1,3 +1,6 @@
 [submodule "3rd_party/diffusers"]
 	path = 3rd_party/diffusers
 	url = https://github.com/huggingface/diffusers.git
+[submodule "3rd_party/flash-attention"]
+	path = 3rd_party/flash-attention
+	url = https://github.com/Dao-AILab/flash-attention.git

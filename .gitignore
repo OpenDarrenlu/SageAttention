@@ -12,3 +12,7 @@ evaluate/
 bench_qk_int8_pv_fp8_cuda_head96.py
 *test.py
 *unmask.py
+*.pt
+*.ncu-rep
+*.json
+*.log

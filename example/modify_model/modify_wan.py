@@ -66,7 +66,14 @@ class WanAttnProcessor2_0:
             
             hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
-
+        # get attn input shape
+        print(f"query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        # 保存 q k v 到 .pt 文件，保存在当前设备
+        torch.save({
+            'query': query,
+            'key': key,
+            'value': value
+        }, 'qkv_tensors.pt')
         hidden_states = self.attn_func(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
@@ -92,18 +99,30 @@ def set_sage_attn_wan(
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=True,
+    )
+    profiler.start()
     # test WanAttnProcessor2_0 with a dummy WanTransformer3DModel
     from diffusers import WanTransformer3DModel
+    IN_CHANNELS = 16
+    OUT_CHANNELS = 16
+    NUM_LAYERS = 2
+    NUM_FRAMES = 4  
+    WIDTH = 64
+    HEIGHT = 64
     model = WanTransformer3DModel(
-        in_channels=4,
-        out_channels=4,
-        attention_head_dim=8,
-        num_attention_heads=8,
-        num_layers=2
+        in_channels=IN_CHANNELS,
+        out_channels=OUT_CHANNELS,
+        attention_head_dim=128,
+        num_attention_heads=12,
+        num_layers=NUM_LAYERS,
     ).to(torch.bfloat16).to(device)
     set_sage_attn_wan(model, F.scaled_dot_product_attention)
-    x = torch.randn(1, 4, 4, 64, 64).to(torch.bfloat16).to(device)
-    encoder_hidden_states = torch.randn(1, 257 + 16, 4096).to(torch.bfloat16).to(device)
+    x = torch.randn(1, IN_CHANNELS, NUM_FRAMES, WIDTH, HEIGHT).to(torch.bfloat16).to(device)
+    encoder_hidden_states = torch.randn(1, 257 + IN_CHANNELS, 4096).to(torch.bfloat16).to(device)
     timestep = torch.randint(0, 1000, (1,)).to(torch.bfloat16).to(device)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -116,7 +135,7 @@ if __name__ == "__main__":
     end.record()
     torch.cuda.synchronize()
     print(f"Time cost(scaled_dot_product_attention): {start.elapsed_time(end)} ms")
-    print(output.shape)  # should be [1, 4, 4, 64, 64]
+    print(output.shape)  # should be [1, OUT_CHANNELS, NUM_FRAMES, WIDTH, HEIGHT]
     assert output.shape == x.shape
     print("WanAttnProcessor2_0 test passed.")
     # test sage attention and compare with original attention
@@ -134,3 +153,6 @@ if __name__ == "__main__":
     relative_error = diff.max() / torch.abs(output).max()
     print(f"Relative error: {relative_error}")
     # print("Sage attention test passed.")
+    profiler.stop()
+    # print(profiler.key_averages().table())
+    profiler.export_chrome_trace("trace.json")
