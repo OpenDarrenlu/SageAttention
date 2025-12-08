@@ -68,12 +68,26 @@ class WanAttnProcessor2_0:
             hidden_states_img = hidden_states_img.type_as(query)
         # get attn input shape
         print(f"query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
-        # 保存 q k v 到 .pt 文件，保存在当前设备
-        torch.save({
-            'query': query,
-            'key': key,
-            'value': value
-        }, 'qkv_tensors.pt')
+        # 为transformer的每一层都保存 q k v 到 .pt 文件，保存在当前设备
+        import os
+        pts_in_pwd = [f for f in os.listdir() if f.endswith(".pt")]
+        if len(pts_in_pwd) == 0:
+            max_id = -1
+        else:
+            max_id = max([int(f.split(".")[0].split("_")[-1]) for f in pts_in_pwd])
+        
+        now_pt_path = f"qkv_tensors_{max_id + 1}.pt"
+        
+        if (not os.path.exists(now_pt_path)):
+            torch.save({
+                'query': query,
+                'key': key,
+                'value': value
+            }, now_pt_path)
+        else:
+            print(f"qkv_tensors_{max_id + 1}.pt already exists, skip saving")
+        
+        
         hidden_states = self.attn_func(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
