@@ -34,7 +34,7 @@ def clear_l2_cache(device_id=0):
         del dummy_data
         torch.cuda.empty_cache() # 帮助释放被 PyTorch 缓存的内存
 
-def test_precision_comparison_simple():
+def test_precision_comparison_simple(id=0):
     """
     测试精度对比脚本的简单版本，验证基本功能
     """
@@ -60,67 +60,77 @@ def test_precision_comparison_simple():
         causal = False
         
         # 生成测试数（HND布局）
-        print(f"生成测试数据: batch_size={batch_size}, seq_len={seq_len}, n_heads={n_heads}, head_dim={head_dim}")
+        # print(f"生成测试数据: batch_size={batch_size}, seq_len={seq_len}, n_heads={n_heads}, head_dim={head_dim}")
         # q = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
         # k = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
         # v = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
         # 从 .pt 文件加载 q, k, v
-        qkv = torch.load('qkv_tensors.pt')
+        qkv = torch.load(f'qkv_tensors_30layers/qkv_tensors_{id}.pt')
         # import ipdb; ipdb.set_trace()
         q,k,v = qkv["query"], qkv["key"], qkv["value"]
         q = q.to(dtype=dtype, device='cuda')
         k = k.to(dtype=dtype, device='cuda')
         v = v.to(dtype=dtype, device='cuda')
+        from fast_hadamard_transform import hadamard_transform
+        # 对 q, k, v 进行 Hadamard 变换
+        import math
+        q = hadamard_transform(q.float(), scale=1/math.sqrt(q.shape[-1])).to(dtype)
+        k = hadamard_transform(k.float(), scale=1/math.sqrt(k.shape[-1])).to(dtype)
         
         # 转换为NHD布局
         q_nld = q.permute(0, 2, 1, 3)
         k_nld = k.permute(0, 2, 1, 3)
         v_nld = v.permute(0, 2, 1, 3)
+        
+        # 对 q, k, v 进行 Hadamard 变换
+        # import math
+        # q_nld = hadamard_transform(q_nld.float(), scale=1/math.sqrt(q_nld.shape[-1])).to(dtype)
+        # k_nld = hadamard_transform(k_nld.float(), scale=1/math.sqrt(k_nld.shape[-1])).to(dtype)
 
-        # 预热
-        print("预热中...")
-        with torch.no_grad():
-            for _ in range(2):
-                sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
-                flash_attn_func(q_nld, k_nld, v_nld, causal=causal)
-                # scaled_dot_product_attention(q, k, v, is_causal=causal)
-        torch.cuda.synchronize()
+        # # 预热
+        # print("预热中...")
+        # with torch.no_grad():
+        #     for _ in range(2):
+        #         sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
+        #         flash_attn_func(q_nld, k_nld, v_nld, causal=causal)
+        #         # scaled_dot_product_attention(q, k, v, is_causal=causal)
+        # torch.cuda.synchronize()
 
-        start_time = torch.cuda.Event(enable_timing=True)
-        end_time = torch.cuda.Event(enable_timing=True)
+        # start_time = torch.cuda.Event(enable_timing=True)
+        # end_time = torch.cuda.Event(enable_timing=True)
         
         # 运行sageattn
         print("运行SageAttention...")
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         with torch.no_grad():
             # 清除L2缓存
             # clear_l2_cache()
             # --- NCU Range: SageAttention ---
-            torch.cuda.nvtx.range_push("SageAttention")
-            start_time.record()
+            # torch.cuda.nvtx.range_push("SageAttention")
+            # start_time.record()
             sage_output = sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
-            end_time.record()
-            torch.cuda.synchronize()
-            print(f"SageAttention运行时间: {start_time.elapsed_time(end_time):.4f} ms")
-            torch.cuda.nvtx.range_pop()
+            # end_time.record()
+            # torch.cuda.synchronize()
+            # print(f"SageAttention运行时间: {start_time.elapsed_time(end_time):.4f} ms")
+            # torch.cuda.nvtx.range_pop()
         print(f"SageAttention输出形状: {sage_output.shape}")
         # 运行flash attention 2
         print("运行Flash Attention 2...")
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         with torch.no_grad():
             # 清除L2缓存
             # clear_l2_cache()
             # --- NCU Range: FlashAttention2 ---
-            torch.cuda.nvtx.range_push("FlashAttention2")
-            start_time.record()
+            # torch.cuda.nvtx.range_push("FlashAttention2")
+            # start_time.record()
             if USE_FLASH_ATTN:
                 flash_output_nld = flash_attn_func(q_nld, k_nld, v_nld, causal=causal)
             else:
                 flash_output_nld = scaled_dot_product_attention(q, k, v, is_causal=causal)
-            end_time.record()
-            torch.cuda.synchronize()
-            print(f"Flash Attention 2运行时间: {start_time.elapsed_time(end_time):.4f} ms") 
-            torch.cuda.nvtx.range_pop()
+            # end_time.record()
+            # torch.cuda.synchronize()
+            # print(f"Flash Attention 2运行时间: {start_time.elapsed_time(end_time):.4f} ms") 
+            # torch.cuda.nvtx.range_pop()
         flash_output = flash_output_nld.permute(0, 2, 1, 3)  # 转回HND布局
         print(f"Flash Attention 2输出形状: {flash_output.shape}")
         
@@ -134,6 +144,8 @@ def test_precision_comparison_simple():
         print(f"\n简单精度指标:")
         print(f"平均绝对误差 (MAE): {mae:.8f}")
         print(f"Cosine相似度: {cos_sim:.8f}")
+        with open(f"precision_comparison.txt", "a") as f:
+            f.write(f"{id}\t{mae:.8f}\t{cos_sim:.8f}\n")
         
         print("\n精度对比基本功能测试通过!")
         return True
@@ -258,7 +270,6 @@ def test_performance_comparison_simple(seq_len: int = 4096):
         traceback.print_exc()
         return False
 
-
 def main():
     """
     主测试函数
@@ -291,14 +302,17 @@ def main():
         # test_performance_comparison_simple,
     ]
     
-    # use torch.profiler
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        record_shapes=True,
-        with_stack=True
-    ) as profiler:
-        test_performance_comparison_simple(seq_len)
-    profiler.export_chrome_trace(f"trace{seq_len//1024}k.json")
+    # # use torch.profiler
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    #     record_shapes=True,
+    #     with_stack=True
+    # ) as profiler:
+    #     test_performance_comparison_simple(seq_len)
+    # profiler.export_chrome_trace(f"trace{seq_len//1024}k.json")
+
+    for i in range(31):
+        test_precision_comparison_simple(id=i)
 
     # for test_func in tests:
     #     result = test_func()
