@@ -78,9 +78,9 @@ def test_precision_comparison_simple(id=0):
         k = hadamard_transform(k.float(), scale=1/math.sqrt(k.shape[-1])).to(dtype)
         
         # 转换为NHD布局
-        q_nld = q.permute(0, 2, 1, 3)
-        k_nld = k.permute(0, 2, 1, 3)
-        v_nld = v.permute(0, 2, 1, 3)
+        q_nhd = q.permute(0, 2, 1, 3)
+        k_nhd = k.permute(0, 2, 1, 3)
+        v_nhd = v.permute(0, 2, 1, 3)
         
         # 对 q, k, v 进行 Hadamard 变换
         # import math
@@ -108,11 +108,13 @@ def test_precision_comparison_simple(id=0):
             # --- NCU Range: SageAttention ---
             # torch.cuda.nvtx.range_push("SageAttention")
             # start_time.record()
-            sage_output = sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
+            # sage_output = sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
+            sage_output = sageattn(q_nhd, k_nhd, v_nhd, tensor_layout='NHD', is_causal=causal)
             # end_time.record()
             # torch.cuda.synchronize()
             # print(f"SageAttention运行时间: {start_time.elapsed_time(end_time):.4f} ms")
             # torch.cuda.nvtx.range_pop()
+        sage_output = sage_output.permute(0, 2, 1, 3)  # 转回HND布局
         print(f"SageAttention输出形状: {sage_output.shape}")
         # 运行flash attention 2
         print("运行Flash Attention 2...")
@@ -124,7 +126,7 @@ def test_precision_comparison_simple(id=0):
             # torch.cuda.nvtx.range_push("FlashAttention2")
             # start_time.record()
             if USE_FLASH_ATTN:
-                flash_output_nld = flash_attn_func(q_nld, k_nld, v_nld, causal=causal)
+                flash_output_nld = flash_attn_func(q_nhd, k_nhd, v_nhd, causal=causal)
             else:
                 flash_output_nld = scaled_dot_product_attention(q, k, v, is_causal=causal)
             # end_time.record()
@@ -137,15 +139,15 @@ def test_precision_comparison_simple(id=0):
         # 计算简单的精度指标
         mae = torch.mean(torch.abs(sage_output - flash_output)).item()
         cos_sim = torch.nn.functional.cosine_similarity(
-            sage_output.reshape(-1).unsqueeze(0), 
-            flash_output.reshape(-1).unsqueeze(0)
-        ).item()
+            sage_output,
+            flash_output,
+        )
         
         print(f"\n简单精度指标:")
         print(f"平均绝对误差 (MAE): {mae:.8f}")
-        print(f"Cosine相似度: {cos_sim:.8f}")
+        print(f"Cosine相似度: {cos_sim.mean().item():.8f}")
         with open(f"precision_comparison.txt", "a") as f:
-            f.write(f"{id}\t{mae:.8f}\t{cos_sim:.8f}\n")
+            f.write(f"{id}\t{mae:.8f}\t{cos_sim.mean().item():.8f}\n")
         
         print("\n精度对比基本功能测试通过!")
         return True

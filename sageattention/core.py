@@ -276,8 +276,8 @@ def sageattn_qk_int8_pv_fp16_triton(
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
-        nqheads = q.size(2)
-        nkheads = k.size(2)
+        nqheads = q.size(nh_dim)
+        nkheads = k.size(nh_dim)
         q_per_kv_heads = nqheads // nkheads
         if q_per_kv_heads > 1:
             # nheads_k => nheads_q
