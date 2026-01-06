@@ -137,17 +137,20 @@ def test_precision_comparison_simple(id=0):
         print(f"Flash Attention 2输出形状: {flash_output.shape}")
         
         # 计算简单的精度指标
-        mae = torch.mean(torch.abs(sage_output - flash_output)).item()
+        max_error = (sage_output - flash_output).abs().max().item()
+        rel_error = (sage_output - flash_output).abs().max() / (flash_output.abs().max() + 1e-8)
+
         cos_sim = torch.nn.functional.cosine_similarity(
             sage_output,
             flash_output,
         )
         
         print(f"\n简单精度指标:")
-        print(f"平均绝对误差 (MAE): {mae:.8f}")
+        print(f"最大绝对误差 (Max Error): {max_error:.8f}")
+        print(f"最大相对误差: {rel_error.item():.8f}")
         print(f"Cosine相似度: {cos_sim.mean().item():.8f}")
         with open(f"precision_comparison.txt", "a") as f:
-            f.write(f"{id}\t{mae:.8f}\t{cos_sim.mean().item():.8f}\n")
+            f.write(f"{id}\t{max_error:.8f}\t{rel_error.item():.8f}\t{cos_sim.mean().item():.8f}\n")
         
         print("\n精度对比基本功能测试通过!")
         return True

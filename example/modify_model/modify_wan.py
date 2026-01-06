@@ -5,6 +5,52 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models import WanTransformer3DModel
 from functools import partial
 
+DEBUG = True
+
+def simple_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+    if attn_mask is not None:
+        attn_weights = attn_weights + attn_mask
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    # sage attn_weights to .pt # 为transformer的每一层都保存 attn_weights 到 .pt 文件，保存在当前设备
+    if (DEBUG):
+        # get attn input shape
+        print(f"query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}, attn_weights shape: {attn_weights.shape}")
+        # 为transformer的每一层都保存 q k v 到 .pt 文件，保存在当前设备
+        import os
+        pts_in_pwd = [f for f in os.listdir() if f.endswith(".pt")]
+        if len(pts_in_pwd) == 0:
+            max_id = -1
+        else:
+            max_id = max([int(f.split(".")[0].split("_")[-1]) for f in pts_in_pwd])
+        
+        now_pt_path = f"qkvp_tensors_{max_id + 1}.pt"
+        
+        if (not os.path.exists(now_pt_path)):
+            torch.save({
+                'query': query,
+                'key': key,
+                'value': value,
+                'prob': attn_weights
+            }, now_pt_path)
+        else:
+            print(f"qkvp_tensors_{max_id + 1}.pt already exists, skip saving")
+    # assert attn_weights is [0,1]
+    assert torch.all((attn_weights >= 0) & (attn_weights <= 1))
+    # clamp attn_weights to [0, fp16.tiny]
+    f16_tiny = torch.finfo(torch.float16).tiny
+    # attn_weights = attn_weights.clamp(min=0, max=f16_tiny)
+    attn_weights = attn_weights.clamp(min=f16_tiny, max=1)
+    return torch.matmul(attn_weights, value)
+
+def simple_attention0(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+    if attn_mask is not None:
+        attn_weights = attn_weights + attn_mask
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    # assert attn_weights is [0,1]
+    assert torch.all((attn_weights >= 0) & (attn_weights <= 1))
+    return torch.matmul(attn_weights, value)
 
 class WanAttnProcessor2_0:
     def __init__(self, attn_func):
@@ -66,27 +112,6 @@ class WanAttnProcessor2_0:
             
             hidden_states_img = hidden_states_img.transpose(1, 2).flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
-        # get attn input shape
-        print(f"query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
-        # 为transformer的每一层都保存 q k v 到 .pt 文件，保存在当前设备
-        import os
-        pts_in_pwd = [f for f in os.listdir() if f.endswith(".pt")]
-        if len(pts_in_pwd) == 0:
-            max_id = -1
-        else:
-            max_id = max([int(f.split(".")[0].split("_")[-1]) for f in pts_in_pwd])
-        
-        now_pt_path = f"qkv_tensors_{max_id + 1}.pt"
-        
-        if (not os.path.exists(now_pt_path)):
-            torch.save({
-                'query': query,
-                'key': key,
-                'value': value
-            }, now_pt_path)
-        else:
-            print(f"qkv_tensors_{max_id + 1}.pt already exists, skip saving")
-        
         
         hidden_states = self.attn_func(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
@@ -118,7 +143,8 @@ if __name__ == "__main__":
         record_shapes=True,
         with_stack=True,
     )
-    profiler.start()
+    if (DEBUG):
+        profiler.start()
     # test WanAttnProcessor2_0 with a dummy WanTransformer3DModel
     from diffusers import WanTransformer3DModel
     IN_CHANNELS = 16
@@ -134,7 +160,8 @@ if __name__ == "__main__":
         num_attention_heads=12,
         num_layers=NUM_LAYERS,
     ).to(torch.bfloat16).to(device)
-    set_sage_attn_wan(model, F.scaled_dot_product_attention)
+    # set_sage_attn_wan(model, F.scaled_dot_product_attention)
+    set_sage_attn_wan(model, simple_attention0)
     x = torch.randn(1, IN_CHANNELS, NUM_FRAMES, WIDTH, HEIGHT).to(torch.bfloat16).to(device)
     encoder_hidden_states = torch.randn(1, 257 + IN_CHANNELS, 4096).to(torch.bfloat16).to(device)
     timestep = torch.randint(0, 1000, (1,)).to(torch.bfloat16).to(device)
@@ -154,7 +181,8 @@ if __name__ == "__main__":
     print("WanAttnProcessor2_0 test passed.")
     # test sage attention and compare with original attention
     from sageattention import sageattn
-    set_sage_attn_wan(model, sageattn)
+    # set_sage_attn_wan(model, sageattn)
+    set_sage_attn_wan(model, simple_attention)
     start.record()
     out_sage = model(x, encoder_hidden_states=encoder_hidden_states, timestep=timestep)[0]
     end.record()
@@ -167,6 +195,7 @@ if __name__ == "__main__":
     relative_error = diff.max() / torch.abs(output).max()
     print(f"Relative error: {relative_error}")
     # print("Sage attention test passed.")
-    profiler.stop()
-    # print(profiler.key_averages().table())
-    profiler.export_chrome_trace("trace.json")
+    if (DEBUG):
+        profiler.stop()
+        # print(profiler.key_averages().table())
+        profiler.export_chrome_trace("trace.json")

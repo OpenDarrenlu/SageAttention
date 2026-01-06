@@ -69,6 +69,8 @@ def ring_quant_attn(
     for step in range(num_blocks):
         # import ipdb; ipdb.set_trace()
         if  step & 0x1:
+        # if  step % 3 == 0:
+        # if  step % 2 == 0:
             # use sage attention
             from sageattention import sageattn
             block_out, block_lse = sageattn(
@@ -116,7 +118,7 @@ def test_ring_quant_attn_with_flash_attn():
     q_nhd = q.permute(0, 2, 1, 3)
     k_nhd = k.permute(0, 2, 1, 3)
     v_nhd = v.permute(0, 2, 1, 3)
-    block_KV = 64
+    block_KV = 8
     out, lse = ring_quant_attn(
         q_nhd, k_nhd, v_nhd, block_KV, tensor_layout="NHD", causal=False, return_attn_probs=True
     )
@@ -146,11 +148,32 @@ all flash:
 all sage:
     cos_sim: 0.9999, max_error: 0.0052, rel_error: 0.0151
 
-# real model input:
+# real model input(&0x1, 64):
 sage and flash:
     cos_sim: 1.0000, max_error: 0.1264, rel_error: 0.0300
 all flash:
     cos_sim: 1.0000, max_error: 0.0184, rel_error: 0.0044
 all sage:
     cos_sim: 0.9999, max_error: 0.1549, rel_error: 0.0367
+
+# real model input(&0x1, 8):
+sage and flash:
+    cos_sim: 1.0000, max_error: 0.1415, rel_error: 0.0336
+
+# real model input(&0x1, 2):
+sage and flash:
+    cos_sim: 1.0000, max_error: 0.1061, rel_error: 0.0251
+
+# real model input(&0x1, 1):
+sage and flash:
+    cos_sim: 1.0000, max_error: 0.0949, rel_error: 0.0225
+
+# real model input(%3==0, 1):
+sage and flash:
+    cos_sim: 1.0000, max_error: 0.0854, rel_error: 0.0203
+
+# real model input(%4==0, 1):
+sage and flash:
+    cos_sim: 1.0000, max_error: 0.0859, rel_error: 0.0204
+
 '''
