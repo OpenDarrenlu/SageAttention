@@ -101,19 +101,43 @@ class WanT2V:
             self.model.forward = types.MethodType(usp_dit_forward, self.model)
             self.sp_size = get_sequence_parallel_world_size()
         elif use_delSubnorm:
-            def normal_attn(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False):
-                attn_weights = torch.matmul(query, key.transpose(-1, -2))
-                if attn_mask is not None:
-                    attn_weights = attn_weights + attn_mask
+            def normal_attn(q, k, v, k_lens=None, window_size=None):
+                """
+                Standard multi-head attention with proper shape handling.
+                Input shape: [batch, seq_len, num_heads, head_dim]
+                """
+                # Reorder to [batch, num_heads, seq_len, head_dim] for efficient matmul
+                q = q.transpose(1, 2)  # [b, n, s, d]
+                k = k.transpose(1, 2)  # [b, n, s, d]
+                v = v.transpose(1, 2)  # [b, n, s, d]
+
+                # Scaled dot-product attention
+                attn_weights = torch.matmul(q, k.transpose(-2, -1))  # [b, n, s, s]
+                
+                # Optional: scale by sqrt(d) (you may want this for stability)
+                # attn_weights = attn_weights / (q.size(-1) ** 0.5)
+
+                # Apply softmax -> outputs sum to 1, values in (0, 1)
                 attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                # clamp attn_weights to [0, fp16.tiny]
-                tiny_P = torch.finfo(attn_weights.dtype).tiny
-                # attn_weights = attn_weights.clamp(min=0, max=f16_tiny)
-                attn_weights = attn_weights.clamp(min=tiny_P, max=1)
-                return torch.matmul(attn_weights, value)
+
+                # If you REALLY want to eliminate subnormals (not recommended!),
+                # you can flush them to zero or tiny, but DO NOT clamp the whole distribution.
+                # Example: flush subnormals to zero (preserves sparsity, but breaks prob sum)
+                dtype_info = torch.finfo(attn_weights.dtype)
+                attn_weights = torch.where(
+                    (attn_weights != 0) & (torch.abs(attn_weights) < dtype_info.tiny),
+                    torch.zeros_like(attn_weights),
+                    attn_weights
+                )
+
+                # Compute output
+                output = torch.matmul(attn_weights, v)  # [b, n, s, d]
+                
+                # Restore original shape: [b, s, n, d]
+                output = output.transpose(1, 2).contiguous()
+                return output
             for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    normal_attn, block.self_attn)
+                block.self_attn.attn_func = normal_attn
                 self.sp_size = 1
         else:
             self.sp_size = 1
