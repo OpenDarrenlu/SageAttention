@@ -114,8 +114,8 @@ class WanT2V:
                 # Scaled dot-product attention
                 attn_weights = torch.matmul(q, k.transpose(-2, -1))  # [b, n, s, s]
                 
-                # Optional: scale by sqrt(d) (you may want this for stability)
-                # attn_weights = attn_weights / (q.size(-1) ** 0.5)
+                # scale by sqrt(d) (you may want this for stability)
+                attn_weights = attn_weights / (q.size(-1) ** 0.5)
 
                 # Apply softmax -> outputs sum to 1, values in (0, 1)
                 attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
