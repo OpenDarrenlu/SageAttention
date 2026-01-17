@@ -9,6 +9,17 @@ from modify_model.modify_wan import set_sage_attn_wan
 from tqdm import tqdm
 from sageattention import sageattn
 
+def normal_attn(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+    if attn_mask is not None:
+        attn_weights = attn_weights + attn_mask
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    # clamp attn_weights to [0, fp16.tiny]
+    tiny_P = torch.finfo(attn_weights.dtype).tiny
+    # attn_weights = attn_weights.clamp(min=0, max=f16_tiny)
+    attn_weights = attn_weights.clamp(min=tiny_P, max=1)
+    return torch.matmul(attn_weights, value)
+
 ATTNENTION = {
     "sage": sageattn,
     "sdpa": F.scaled_dot_product_attention,
@@ -35,7 +46,8 @@ pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 if args.compile:
     pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune-no-cudagraphs")
 
-set_sage_attn_wan(pipe.transformer, ATTNENTION[args.attention_type])
+# set_sage_attn_wan(pipe.transformer, ATTNENTION[args.attention_type])
+set_sage_attn_wan(pipe.transformer, normal_attn)
 
 with torch.autocast("cuda", torch.bfloat16, cache_enabled=False):
     video = pipe(prompt=prompt, negative_prompt=None, num_frames=33).frames[0]
