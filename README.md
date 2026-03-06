@@ -4,6 +4,37 @@
 --- -->
 This repository provides the official implementation of SageAttention, SageAttention2, and SageAttention2++, which achieve surprising speedup on most GPUs without lossing accuracy across all models in a plug-and-play way.
 
+> [!IMPORTANT]
+> **This fork adds an sm89 / RTX 4090 optimized INT4 path.**
+> - INT4 quantization is available through `sageattn(..., qk_quant_dtype="int4")` on RTX 4090 class GPUs.
+> - The INT4 branch includes end-to-end benchmark coverage, accuracy regression tests, and a tunable kernel selector for sm89.
+> - On an NVIDIA GeForce RTX 4090 with `batch=4`, `heads=32`, `head_dim=128`, `fp16`, and non-causal attention, the default INT4 path is consistently faster than the INT8 baseline.
+
+## INT4 Fork Highlights
+
+This fork focuses on the Ada `sm89` path and adds a production-ready `INT4 QK + FP8 PV` implementation:
+
+- API: `sageattn(..., qk_quant_dtype="int4")`
+- Direct entry: `sageattn_qk_int4_pv_fp8_cuda(...)`
+- Target GPU: RTX 4090 class (`sm89`)
+- Quantization granularity: `per_thread`
+- Default tuned kernel config on 4090: `cfg0`
+
+### RTX 4090 Speedup of INT4 vs INT8
+
+Measured on an NVIDIA GeForce RTX 4090 with:
+`batch=4`, `num_heads=32`, `head_dim=128`, `dtype=fp16`, `is_causal=False`,
+using `bench/bench_qk_int4_pv_fp8_cuda.py --num_warmups 10 --num_tests 30 --int4-kernel-config all`.
+
+| Sequence Length | INT8 Latency (ms) | INT4 Latency (ms) | Speedup | Mean Abs Diff | Max Abs Diff | Best INT4 Config |
+|-----------------|------------------:|------------------:|--------:|--------------:|-------------:|------------------|
+| 1024            | 0.496             | 0.460             | 1.078x  | 0.00840       | 0.15186      | cfg0             |
+| 2048            | 1.321             | 1.182             | 1.118x  | 0.00599       | 0.09943      | cfg0             |
+| 4096            | 3.755             | 3.258             | 1.153x  | 0.00427       | 0.15173      | cfg0             |
+| 8192            | 12.112            | 10.179            | 1.190x  | 0.00303       | 0.06354      | cfg0             |
+
+> **Summary:** On RTX 4090, the current INT4 branch delivers about **7.8% to 19.0%** end-to-end speedup over the INT8 baseline for the tested long-context settings while keeping output differences bounded.
+
 **SageAttention: Accurate 8-Bit Attention for Plug-and-play Inference Acceleration**  
 Jintao Zhang, Jia Wei, Haofeng Huang, Pengle Zhang, Jun Zhu, Jianfei Chen  
 Paper: https://arxiv.org/abs/2410.02367
@@ -24,7 +55,7 @@ Paper: https://arxiv.org/abs/2505.11594
 <!-- This is a beta release of SageAttention2. We welcome any feedback on accuracy, performance issues, bugs, feature requests, or suggestions. Please feel free to open an issue or launch a pull request! -->
 
 + Optmized kernels for **Ampere, Ada and Hopper GPUs.**
-+ INT8 quantization and smoothing for $QK^\top$ with support for varying granularities.
++ INT8 quantization and smoothing for $QK^\top$ with support for varying granularities, and an sm89 INT4 per-thread branch.
 + FP8 quantization for $PV$, and FP16 accumulator for FP8/FP16 $PV$.
 + Two-level accumulation strategy for $PV$ to improve accuracy in FP8 MMA and WGMMA.
 + Support `torch.compile` with non-cudagraphs mode and distributed inference.
@@ -112,6 +143,7 @@ attn_output = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
 + `sageattn`: Automatically selects the optimal kernel based on the GPU to achieve a good performance-accuracy trade-off.
 + `sageattn_qk_int8_pv_fp16_triton`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using Triton backend.
 + `sageattn_qk_int8_pv_fp16_cuda`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using CUDA backend.
++ `sageattn_qk_int4_pv_fp8_cuda`: INT4 quantization for $QK^\top$ and FP8 for $PV$ on sm89 (RTX 4090 class), optimized for `per_thread` + `fp32+fp16`.
 + `sageattn_qk_int8_pv_fp8_cuda`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend. (Note that setting `pv_accum_dtype=fp32+fp16` corresponds to SageAttention2++.)
 + `sageattn_qk_int8_pv_fp8_cuda_sm90`: INT8 quantization for $QK^\top$ and FP8 for $PV$ using CUDA backend, specifically optimized for Hopper GPUs.
 + `sageattn_varlen`: INT8 quantization for $QK^\top$ and FP16 for $PV$ using Triton backend. Support for varying sequence lengths within the same batch.
@@ -120,6 +152,8 @@ For optimal speed and accuracy performance on custom devices and models, we stro
 
 > **Note:**
 Support for different sequence lengths between `q` and `k,v` and `group-query attention` is available.
+For sm89, you can use `sageattn(..., qk_quant_dtype="int4")` to enable the new INT4 QK branch.
+For kernel tuning and benchmarking on sm89, `sageattn_qk_int4_pv_fp8_cuda(..., int4_kernel_config=<id>)` supports config ids `0-2`, and the provided benchmark script can sweep them automatically.
 
 
 ### Plug-and-play Example

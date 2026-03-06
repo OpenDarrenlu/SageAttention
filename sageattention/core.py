@@ -25,6 +25,7 @@ from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
 from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
 
 from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
+from .triton.quant_per_thread import per_thread_int4 as per_thread_int4_triton
 
 try:
     from . import sm80_compile
@@ -51,6 +52,7 @@ from .quant import per_channel_fp8
 
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
+import os
 
 import subprocess
 import re
@@ -76,6 +78,30 @@ def get_cuda_arch_versions():
     return cuda_archs
 
 
+def get_int4_kernel_config(head_dim: int, qo_len: int, kv_len: int, kernel_config: Optional[int] = None) -> Tuple[int, int, int, int, int]:
+    if kernel_config is not None:
+        pass
+    else:
+        env_override = os.getenv("SAGEATTN_INT4_KERNEL_CONFIG")
+        if env_override is not None:
+            try:
+                kernel_config = int(env_override)
+            except ValueError as exc:
+                raise ValueError(f"Invalid SAGEATTN_INT4_KERNEL_CONFIG={env_override!r}") from exc
+        else:
+            kernel_config = 0
+
+    config_map = {
+        0: (0, 128, 32, 64, 64),
+        1: (1, 128, 64, 64, 64),
+        2: (2, 64, 64, 64, 64),
+    }
+    if kernel_config not in config_map:
+        supported = ", ".join(str(key) for key in sorted(config_map))
+        raise ValueError(f"Unsupported int4 kernel config {kernel_config}. Supported values: {supported}")
+    return config_map[kernel_config]
+
+
 def sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -84,6 +110,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    qk_quant_dtype: str = "int8",
     **kwargs: Any,
 ):
     """
@@ -121,6 +148,12 @@ def sageattn(
         Whether to return the log sum of the exponentiated attention weights. Used for cases like Ring Attention.
         Default: False.
 
+    qk_quant_dtype : str
+        The quantization dtype used for the QK path.
+        - "int8": available on all supported architectures.
+        - "int4": available only on sm89.
+        Default: "int8".
+
     Returns
     -------
     torch.Tensor
@@ -139,13 +172,22 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
+
     arch = get_cuda_arch_versions()[q.device.index]
+    supported_qk_quant_dtypes = {"int8"}
+    if arch == "sm89":
+        supported_qk_quant_dtypes.add("int4")
+    if qk_quant_dtype not in supported_qk_quant_dtypes:
+        supported = ", ".join(sorted(supported_qk_quant_dtypes))
+        raise ValueError(f"Unsupported qk_quant_dtype for {arch}: {qk_quant_dtype}. Supported values: {supported}")
+
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
         return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     elif arch == "sm89":
+        if qk_quant_dtype == "int4":
+            return sageattn_qk_int4_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16", **kwargs)
         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp16")
     elif arch == "sm90":
         return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
@@ -322,6 +364,118 @@ def sageattn_qk_int8_pv_fp16_triton(
             except Exception:
                 raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
         o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
+
+    o = o[..., :head_dim_og]
+
+    if return_lse:
+        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+    else:
+        return o
+
+
+def sageattn_qk_int4_pv_fp8_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32+fp16",
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    SageAttention for sm89 with per-thread INT4 quantization for QK^T and FP8 PV.
+
+    Additional kwargs
+    -----------------
+    int4_kernel_config : Optional[int]
+        Internal sm89 tuning selector for the INT4 path. Supported values: 0-2.
+        If omitted, the default tuned config is used. `SAGEATTN_INT4_KERNEL_CONFIG`
+        can also be used as an environment override.
+    """
+    dtype = q.dtype
+    assert SM89_ENABLED, "SM89 kernel is not available. Make sure you GPUs with compute capability 8.9."
+    assert q.is_cuda, "Input tensors must be on cuda."
+    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
+    assert qk_quant_gran in ["per_thread"], "INT4 path currently supports only 'per_thread'."
+    assert q.device == k.device == v.device, "All tensors must be on the same device."
+    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    assert pv_accum_dtype == "fp32+fp16", "INT4 path currently supports only pv_accum_dtype='fp32+fp16'."
+
+    # FIXME(DefTruth): make sage attention work compatible with distributed
+    # env, for example, xDiT which launch by torchrun. Without this workaround,
+    # sage attention will run into illegal memory access error after first
+    # inference step in distributed env for multi gpus inference. This small
+    # workaround also make sage attention work compatible with torch.compile
+    # through non-fullgraph compile mode.
+    torch.cuda.set_device(v.device)
+
+    _tensor_layout = 0 if tensor_layout == "NHD" else 1
+    _is_caual = 1 if is_causal else 0
+    _qk_quant_gran = 3  # per_thread only
+    _return_lse = 1 if return_lse else 0
+
+    head_dim_og = q.size(-1)
+
+    if head_dim_og < 64:
+        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
+
+    if sm_scale is None:
+        sm_scale = head_dim_og**-0.5
+
+    seq_dim = 1 if _tensor_layout == 0 else 2
+    nh_dim = 2 if _tensor_layout == 0 else 1
+
+    if smooth_k:
+        km = k.mean(dim=seq_dim, keepdim=True)
+        nqheads = q.size(nh_dim)
+        nkheads = k.size(nh_dim)
+        q_per_kv_heads = nqheads // nkheads
+        if q_per_kv_heads > 1:
+            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
+        else:
+            km_broadcast = km
+        if return_lse:
+            if tensor_layout == "NHD":
+                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
+            else:
+                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
+    else:
+        km = None
+
+    requested_kernel_config = kwargs.get("int4_kernel_config")
+    kernel_config, blkq, warpq, blkk, warpk = get_int4_kernel_config(
+        head_dim=q.size(-1), qo_len=q.size(seq_dim), kv_len=k.size(seq_dim), kernel_config=requested_kernel_config
+    )
+    q_int4, q_scale, k_int4, k_scale = per_thread_int4_triton(
+        q, k, km, tensor_layout=tensor_layout, BLKQ=blkq, WARPQ=warpq, BLKK=blkk, WARPK=warpk
+    )
+
+    o = torch.empty(q.size(), dtype=dtype, device=q.device)
+
+    if smooth_v:
+        warnings.warn("pv_accum_dtype is 'fp32+fp16', smooth_v will be ignored.")
+        smooth_v = False
+
+    v_fp8, v_scale, _ = per_channel_fp8(v, tensor_layout=tensor_layout, scale_max=2.25, smooth_v=False)
+    lse = sm89_compile.qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+        q_int4, k_int4, v_fp8, o, q_scale, k_scale, v_scale,
+        _tensor_layout, _is_caual, _qk_quant_gran, kernel_config, sm_scale, _return_lse
+    )
 
     o = o[..., :head_dim_og]
 

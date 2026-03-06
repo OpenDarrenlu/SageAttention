@@ -25,6 +25,12 @@ python bench_qk_int8_pv_fp8_cuda.py --pv_accum_dtype fp32+fp16 --quant_gran per_
 
 # on H100
 python bench_qk_int8_pv_fp8_cuda_sm90.py --pv_accum_dtype fp32+fp32 --quant_gran per_thread
+
+# on RTX 4090, compare int4 vs int8 (end-to-end)
+python bench_qk_int4_pv_fp8_cuda.py --seqlens 1024,2048,4096,8192
+
+# on RTX 4090, sweep int4 kernel configs and report the fastest one
+python bench_qk_int4_pv_fp8_cuda.py --seqlens 1024,2048,4096,8192 --int4-kernel-config all
 ```
 
 ## Benchmarking Results

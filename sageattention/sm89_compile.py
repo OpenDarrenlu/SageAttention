@@ -66,6 +66,28 @@ def qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
     )
 
 
+@torch.library.custom_op("sageattention_sm89::qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf", mutates_args=("output",), device_types="cuda")
+def qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    query_scale: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    tensor_layout: int,
+    is_causal: int,
+    qk_quant_gran: int,
+    kernel_config: int,
+    sm_scale: float,
+    return_lse: int,
+) -> torch.Tensor:
+    return _qattn_sm89.qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+        query, key, value, output, query_scale, key_scale, value_scale,
+        tensor_layout, is_causal, qk_quant_gran, kernel_config, sm_scale, return_lse
+    )
+
+
 def sm89_qk_with_key_value(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -77,6 +99,7 @@ def sm89_qk_with_key_value(
     tensor_layout: int, 
     is_causal: int, 
     qk_quant_gran: int, 
+    kernel_config: int,
     sm_scale: float,
     return_lse: int,
 ) -> torch.Tensor:
@@ -99,6 +122,7 @@ def sm89_qk_with_key_value(
 torch.library.register_fake("sageattention_sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf")(sm89_qk_with_key_value)
 torch.library.register_fake("sageattention_sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")(sm89_qk_with_key_value)
 torch.library.register_fake("sageattention_sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn")(sm89_qk_with_key_value)
+torch.library.register_fake("sageattention_sm89::qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")(sm89_qk_with_key_value)
 
 
 @torch.library.custom_op("sageattention_sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn", mutates_args=("output",), device_types="cuda")
