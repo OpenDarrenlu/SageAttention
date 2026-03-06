@@ -350,9 +350,8 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
   }
 }
 
-// for DTypeQKAccum float
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
-__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
+__device__ __forceinline__ void update_mdo_states(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
 {
   static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
 #pragma unroll
@@ -432,29 +431,105 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
           }
         }
       }
+    }
+  }
+}
 
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, bool exp_offset, bool fuse_scale=false>
+__device__ __forceinline__ void apply_softmax_exp(float RS[][num_tiles_k][8], float m[][2], const float &sm_scale)
+{
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++)
+    {
       // raise RS to exponent
       float negative_m = -m[fq][k];
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++)
       {
+        float logits_0, logits_1, logits_4, logits_5;
         if constexpr (fuse_scale)
         {
-          RS[fq][fk][k * 2 + 0] = math::ptx_exp2(RS[fq][fk][k * 2 + 0] + negative_m);
-          RS[fq][fk][k * 2 + 1] = math::ptx_exp2(RS[fq][fk][k * 2 + 1] + negative_m);
-          RS[fq][fk][k * 2 + 4] = math::ptx_exp2(RS[fq][fk][k * 2 + 4] + negative_m);
-          RS[fq][fk][k * 2 + 5] = math::ptx_exp2(RS[fq][fk][k * 2 + 5] + negative_m);
+          logits_0 = RS[fq][fk][k * 2 + 0] + negative_m;
+          logits_1 = RS[fq][fk][k * 2 + 1] + negative_m;
+          logits_4 = RS[fq][fk][k * 2 + 4] + negative_m;
+          logits_5 = RS[fq][fk][k * 2 + 5] + negative_m;
         }
         else
         {
-          RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
+          logits_0 = fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m);
+          logits_1 = fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m);
+          logits_4 = fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m);
+          logits_5 = fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m);
         }
+
+        RS[fq][fk][k * 2 + 0] = math::ptx_exp2(logits_0);
+        RS[fq][fk][k * 2 + 1] = math::ptx_exp2(logits_1);
+        RS[fq][fk][k * 2 + 4] = math::ptx_exp2(logits_4);
+        RS[fq][fk][k * 2 + 5] = math::ptx_exp2(logits_5);
       }
     }
   }
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, bool exp_offset, bool fuse_scale=false>
+__device__ __forceinline__ void pack_softmax_e4m3_lut64(float RS[][num_tiles_k][8], uint32_t RS_f8[][num_tiles_k / 2][4], float m[][2], const float &sm_scale, const unsigned char *lut)
+{
+  static_assert(exp_offset, "Direct E4M3 LUT path requires exp_offset softmax.");
+  static_assert(num_tiles_k % 2 == 0, "num_tiles_k must be even for packed E4M3 LUT output.");
+
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++)
+    {
+      float negative_m = -m[fq][k];
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+      {
+        float logits_0, logits_1, logits_4, logits_5;
+        if constexpr (fuse_scale)
+        {
+          logits_0 = RS[fq][fk][k * 2 + 0] + negative_m;
+          logits_1 = RS[fq][fk][k * 2 + 1] + negative_m;
+          logits_4 = RS[fq][fk][k * 2 + 4] + negative_m;
+          logits_5 = RS[fq][fk][k * 2 + 5] + negative_m;
+        }
+        else
+        {
+          logits_0 = fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m);
+          logits_1 = fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m);
+          logits_4 = fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m);
+          logits_5 = fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m);
+        }
+
+        const float delta_0 = S_FP8_OFFSET - logits_0;
+        const float delta_1 = S_FP8_OFFSET - logits_1;
+        const float delta_4 = S_FP8_OFFSET - logits_4;
+        const float delta_5 = S_FP8_OFFSET - logits_5;
+        const uint32_t packed = math::pack_softmax_e4m3_lut64(delta_0, delta_1, delta_4, delta_5, lut);
+        RS_f8[fq][fk / 2][(fk % 2) * 2 + k] = packed;
+      }
+    }
+  }
+}
+
+// for DTypeQKAccum float
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
+__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
+{
+  update_mdo_states<num_tiles_q, num_tiles_k, num_tiles_v, use_half_o_scale, exp_offset, fuse_scale>(RS, RO, m, d, sm_scale);
+  apply_softmax_exp<num_tiles_q, num_tiles_k, exp_offset, fuse_scale>(RS, m, sm_scale);
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
+__device__ __forceinline__ void update_mdo_pack_f8_lut64(float RS[][num_tiles_k][8], uint32_t RS_f8[][num_tiles_k / 2][4], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale, const unsigned char *lut)
+{
+  update_mdo_states<num_tiles_q, num_tiles_k, num_tiles_v, use_half_o_scale, exp_offset, fuse_scale>(RS, RO, m, d, sm_scale);
+  pack_softmax_e4m3_lut64<num_tiles_q, num_tiles_k, exp_offset, fuse_scale>(RS, RS_f8, m, sm_scale, lut);
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, typename T>

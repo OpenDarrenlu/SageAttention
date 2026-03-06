@@ -28,5 +28,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("qk_int8_sv_f8_accum_f16_attn_inst_buf", &qk_int8_sv_f8_accum_f16_attn_inst_buf, "QK int8 sv f8 accum f16 attn inst buf");
   m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf, "QK int8 sv f8 accum f32 fuse v scale attn inst buf");
   m.def("qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf, "QK int8 sv f8 accum f16 fuse v scale attn inst buf");
+  m.def("qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf_lut", &qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf_lut, "QK int8 sv f8 accum f16 fuse v scale attn inst buf lut");
   m.def("qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf", &qk_int4_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf, "QK int4 sv f8 accum f16 fuse v scale attn inst buf");
 }
