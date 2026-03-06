@@ -46,6 +46,60 @@ __forceinline__ __device__ float ptx_exp2(float x) {
   return y;
 }
 
+constexpr int kSoftmaxE4M3Lut64Entries = 64;
+constexpr float kSoftmaxE4M3Lut64MaxDelta = 8.807f;
+constexpr float kSoftmaxE4M3Lut64Scale = (kSoftmaxE4M3Lut64Entries - 1) / kSoftmaxE4M3Lut64MaxDelta;
+
+static __device__ __constant__ unsigned char kSoftmaxE4M3Lut64[kSoftmaxE4M3Lut64Entries] = {
+    126, 125, 124, 122, 121, 121, 120, 118,
+    117, 116, 115, 114, 113, 112, 110, 109,
+    108, 107, 106, 105, 104, 103, 101, 100,
+    99, 98, 97, 96, 95, 93, 92, 91,
+    90, 89, 88, 87, 86, 84, 83, 82,
+    81, 80, 79, 78, 77, 75, 74, 73,
+    73, 72, 70, 69, 68, 67, 66, 65,
+    64, 62, 61, 60, 59, 58, 57, 56,
+};
+
+__forceinline__ __device__ void load_softmax_e4m3_lut64_to_shared(unsigned char *smem_lut) {
+  const uint32_t thread_linear_idx = threadIdx.x + blockDim.x * threadIdx.y;
+  if (thread_linear_idx < kSoftmaxE4M3Lut64Entries) {
+    smem_lut[thread_linear_idx] = kSoftmaxE4M3Lut64[thread_linear_idx];
+  }
+}
+
+__forceinline__ __device__ int softmax_e4m3_lut64_index(float delta) {
+  if (delta >= kSoftmaxE4M3Lut64MaxDelta) {
+    return -1;
+  }
+
+  float clamped_delta = fmaxf(delta, 0.0f);
+  int index = __float2int_rn(clamped_delta * kSoftmaxE4M3Lut64Scale);
+  return max(0, min(kSoftmaxE4M3Lut64Entries - 1, index));
+}
+
+__forceinline__ __device__ unsigned char lookup_softmax_e4m3_lut64(float delta, const unsigned char *lut) {
+  const int index = softmax_e4m3_lut64_index(delta);
+  return (index < 0) ? 0 : lut[index];
+}
+
+__forceinline__ __device__ uint32_t pack_u8x4(
+    unsigned char v0, unsigned char v1, unsigned char v2, unsigned char v3) {
+  return static_cast<uint32_t>(v0) |
+         (static_cast<uint32_t>(v1) << 8) |
+         (static_cast<uint32_t>(v2) << 16) |
+         (static_cast<uint32_t>(v3) << 24);
+}
+
+__forceinline__ __device__ uint32_t pack_softmax_e4m3_lut64(
+    float delta0, float delta1, float delta2, float delta3, const unsigned char *lut) {
+  return pack_u8x4(
+      lookup_softmax_e4m3_lut64(delta0, lut),
+      lookup_softmax_e4m3_lut64(delta1, lut),
+      lookup_softmax_e4m3_lut64(delta2, lut),
+      lookup_softmax_e4m3_lut64(delta3, lut));
+}
+
 /*!
  * \brief Wrapper of PTX lg2.approx instruction, which computes log2(x)
  * \param x input

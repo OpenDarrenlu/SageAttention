@@ -1,14 +1,4 @@
-# SageAttention
-<!-- We are continuously updating more features. You could **Star** and **Watch** our repository to stay updated.
-
---- -->
-This repository provides the official implementation of SageAttention, SageAttention2, and SageAttention2++, which achieve surprising speedup on most GPUs without lossing accuracy across all models in a plug-and-play way.
-
-> [!IMPORTANT]
-> **This fork adds an sm89 / RTX 4090 optimized INT4 path.**
-> - INT4 quantization is available through `sageattn(..., qk_quant_dtype="int4")` on RTX 4090 class GPUs.
-> - The INT4 branch includes end-to-end benchmark coverage, accuracy regression tests, and a tunable kernel selector for sm89.
-> - On an NVIDIA GeForce RTX 4090 with `batch=4`, `heads=32`, `head_dim=128`, `fp16`, and non-causal attention, the default INT4 path is consistently faster than the INT8 baseline.
+# SageAttention Int4
 
 ## INT4 Fork Highlights
 
@@ -32,6 +22,114 @@ using `bench/bench_qk_int4_pv_fp8_cuda.py --num_warmups 10 --num_tests 30 --int4
 | 2048            | 1.321             | 1.182             | 1.118x  | 0.00599       | 0.09943      | cfg0             |
 | 4096            | 3.755             | 3.258             | 1.153x  | 0.00427       | 0.15173      | cfg0             |
 | 8192            | 12.112            | 10.179            | 1.190x  | 0.00303       | 0.06354      | cfg0             |
+
+## Experimental SM89 LUT Softmax
+
+This fork also includes an experimental Ada-only INT8 path that replaces the per-logit softmax `exp` with a direct E4M3 LUT inside the fused attention kernel:
+
+- API: `sageattn_qk_int8_pv_fp8_cuda_lut(...)`
+- CUDA launcher: `csrc/qattn/sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf_lut.cu`
+- Status: functionally correct and useful for ablation, but currently **slower than the original `ex2.approx` softmax path on RTX 4090**, so it is **not** the default fast path.
+
+### LUT implementation principle
+
+The implementation is designed to match the FP8 `PV` dataflow directly instead of producing intermediate float softmax weights:
+
+1. Keep the online softmax state update (`m`, `d`) and keep `o_scale = 2^(m_prev - m_new)` on the original `ex2.approx` path.
+2. Replace only the per-logit `exp` inside the fused `update_mdo` path.
+3. Use a 64-entry direct E4M3 LUT indexed by `δ = max_scaled - score_scaled`, implemented as `δ = 8.807 - logits`.
+4. Clip `δ` to `[0, 8.807]`; values outside the range are mapped to zero.
+5. Emit packed E4M3 bytes directly from the LUT and feed them to the FP8 `PV` MMA path, bypassing the float `exp2` output and the later float-to-FP8 cast.
+
+Implementation files:
+
+- LUT helpers: `csrc/math.cuh`
+- Fused online-softmax split (`update_mdo_states` / LUT pack path): `csrc/qattn/attn_utils.cuh`
+- SM89 fused kernel integration: `csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh`
+
+### RTX 4090 result: LUT is slower than `ex2.approx`
+
+Measured on an NVIDIA GeForce RTX 4090 with:
+`batch=4`, `num_heads=32`, `head_dim=128`, `dtype=fp16`, `qk_quant_gran=per_thread`,
+using `bench/bench_qk_int8_pv_fp8_cuda_lut.py --num_warmups 20 --num_tests 50`.
+
+#### Non-causal attention
+
+| Sequence Length | Original INT8 (ms) | LUT INT8 (ms) | Relative Speed | Mean Abs Diff | Max Abs Diff |
+|-----------------|-------------------:|--------------:|---------------:|--------------:|-------------:|
+| 1024            | 0.570              | 0.628         | 0.908x         | 0.03040       | 0.39307      |
+| 2048            | 1.582              | 1.709         | 0.926x         | 0.02156       | 0.44971      |
+| 4096            | 4.331              | 4.963         | 0.873x         | 0.01501       | 0.26099      |
+
+#### Causal attention
+
+| Sequence Length | Original INT8 (ms) | LUT INT8 (ms) | Relative Speed | Mean Abs Diff | Max Abs Diff |
+|-----------------|-------------------:|--------------:|---------------:|--------------:|-------------:|
+| 2048            | 1.294              | 1.421         | 0.910x         | 0.04132       | 3.40430      |
+| 4096            | 3.294              | 3.762         | 0.876x         | 0.02951       | 3.15234      |
+
+In short, the current 64-entry direct E4M3 LUT kernel is about **7% to 13% slower** than the original fused softmax kernel on RTX 4090, while keeping the average output error reasonably small.
+
+### Why the LUT path is slower on RTX 4090
+
+Based on the current kernel structure, the slowdown on Ada / RTX 4090 is expected for several reasons:
+
+- Ada's `ex2.approx.ftz.f32` is already very fast, so removing per-logit `exp2` does not remove the main bottleneck.
+- The LUT path still keeps `o_scale` on `exp2`, so only part of the online softmax work is replaced.
+- Each 4-logit group now pays extra clamp, scale, round, index, and byte-pack instructions, plus LUT fetches.
+- The original path uses the hardware float-to-E4M3 conversion path after softmax; the LUT path replaces that vectorized cast with scalar lookup and packing logic.
+- The current LUT kernel materializes packed E4M3 weights directly, so denominator accumulation is routed through the FP8 rowsum path instead of the original CUDA-core float accumulation path.
+- Overall, the instruction mix on RTX 4090 becomes worse even though the output path is more “FP8-native”.
+
+### Accuracy and benchmark scripts
+
+Accuracy regression test:
+
+```bash
+python -m pytest tests/test_int8_lut_sageattention.py -q
+```
+
+Non-causal benchmark:
+
+```bash
+python bench/bench_qk_int8_pv_fp8_cuda_lut.py \
+  --batch_size 4 \
+  --num_heads 32 \
+  --head_dim 128 \
+  --seqlens 1024,2048,4096 \
+  --dtype fp16 \
+  --num_warmups 20 \
+  --num_tests 50
+```
+
+Causal benchmark:
+
+```bash
+python bench/bench_qk_int8_pv_fp8_cuda_lut.py \
+  --batch_size 4 \
+  --num_heads 32 \
+  --head_dim 128 \
+  --seqlens 2048,4096 \
+  --dtype fp16 \
+  --is_causal \
+  --num_warmups 20 \
+  --num_tests 50
+```
+
+the following is original readme.
+
+# SageAttention
+<!-- We are continuously updating more features. You could **Star** and **Watch** our repository to stay updated.
+
+--- -->
+This repository provides the official implementation of SageAttention, SageAttention2, and SageAttention2++, which achieve surprising speedup on most GPUs without lossing accuracy across all models in a plug-and-play way.
+
+> [!IMPORTANT]
+> **This fork adds an sm89 / RTX 4090 optimized INT4 path.**
+> - INT4 quantization is available through `sageattn(..., qk_quant_dtype="int4")` on RTX 4090 class GPUs.
+> - The INT4 branch includes end-to-end benchmark coverage, accuracy regression tests, and a tunable kernel selector for sm89.
+> - On an NVIDIA GeForce RTX 4090 with `batch=4`, `heads=32`, `head_dim=128`, `fp16`, and non-causal attention, the default INT4 path is consistently faster than the INT8 baseline.
+
 
 > **Summary:** On RTX 4090, the current INT4 branch delivers about **7.8% to 19.0%** end-to-end speedup over the INT8 baseline for the tested long-context settings while keeping output differences bounded.
 

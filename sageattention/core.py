@@ -980,6 +980,93 @@ def sageattn_qk_int8_pv_fp8_cuda(
         return o
 
 
+def sageattn_qk_int8_pv_fp8_cuda_lut(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32+fp16",
+    smooth_k: bool = True,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    Experimental sm89 INT8 + FP8 path that replaces the fused exp2-based online softmax
+    approximation with a LUT-based approximation inside the CUDA kernel.
+    """
+    dtype = q.dtype
+    assert SM89_ENABLED, "SM89 kernel is not available. Make sure you GPUs with compute capability 8.9."
+    assert q.is_cuda, "Input tensors must be on cuda."
+    assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
+    assert qk_quant_gran in ["per_thread"], "The LUT int8 path currently supports only qk_quant_gran='per_thread'."
+    assert q.device == k.device == v.device, "All tensors must be on the same device."
+    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    assert pv_accum_dtype == "fp32+fp16", "The LUT int8 path currently supports only pv_accum_dtype='fp32+fp16'."
+
+    torch.cuda.set_device(v.device)
+
+    _tensor_layout = 0 if tensor_layout == "NHD" else 1
+    _is_caual = 1 if is_causal else 0
+    _qk_quant_gran = 3
+    _return_lse = 1 if return_lse else 0
+
+    head_dim_og = q.size(-1)
+
+    if head_dim_og < 64:
+        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
+
+    if sm_scale is None:
+        sm_scale = head_dim_og**-0.5
+
+    seq_dim = 1 if _tensor_layout == 0 else 2
+    nh_dim = 2 if _tensor_layout == 0 else 1
+
+    if smooth_k:
+        km = k.mean(dim=seq_dim, keepdim=True)
+        nqheads = q.size(nh_dim)
+        nkheads = k.size(nh_dim)
+        q_per_kv_heads = nqheads // nkheads
+        if q_per_kv_heads > 1:
+            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=nh_dim)
+        else:
+            km_broadcast = km
+        if return_lse:
+            if tensor_layout == "NHD":
+                lse_correction = torch.matmul(q.transpose(1, 2), km_broadcast.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
+            else:
+                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
+    else:
+        km = None
+
+    q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+
+    o = torch.empty(q.size(), dtype=dtype, device=q.device)
+    v_fp8, v_scale, _ = per_channel_fp8(v, tensor_layout=tensor_layout, scale_max=2.25, smooth_v=False)
+    lse = sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf_lut(
+        q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse
+    )
+
+    o = o[..., :head_dim_og]
+
+    if return_lse:
+        return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
+    else:
+        return o
+
+
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
     q: torch.Tensor, 
     k: torch.Tensor, 

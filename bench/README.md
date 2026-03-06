@@ -29,8 +29,18 @@ python bench_qk_int8_pv_fp8_cuda_sm90.py --pv_accum_dtype fp32+fp32 --quant_gran
 # on RTX 4090, compare int4 vs int8 (end-to-end)
 python bench_qk_int4_pv_fp8_cuda.py --seqlens 1024,2048,4096,8192
 
+# on RTX 4090, compare experimental int8 LUT-softmax against original int8
+python bench_qk_int8_pv_fp8_cuda_lut.py --seqlens 1024,2048,4096
+
 # on RTX 4090, sweep int4 kernel configs and report the fastest one
 python bench_qk_int4_pv_fp8_cuda.py --seqlens 1024,2048,4096,8192 --int4-kernel-config all
+
+# on RTX 4090, profile a full attention block breakdown
+# (q/k/v/o linear, rope, quantization, fused SageAttention core, and an unfused reference softmax path)
+python bench_attention_breakdown.py --seqlens 1024,2048,4096 --batch_size 1 --num_warmups 10 --num_tests 20
+
+# on RTX 4090, evaluate the experimental LUT softmax / LUT attention reference
+python bench_lut_softmax.py --seqlens 1024,2048,4096 --batch_size 1 --num_warmups 10 --num_tests 30
 ```
 
 ## Benchmarking Results

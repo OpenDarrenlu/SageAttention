@@ -42,7 +42,7 @@
 #define MMA_SV_K 32
 
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
-        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false>
+        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false, bool use_lut_softmax=false>
 __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale, float *__restrict__ V_mean,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
@@ -61,6 +61,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
   static_assert(CTA_K % 64 == 0);
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+  static_assert(!use_lut_softmax || DenominatorAccumUnit == ComputeUnit::kTensorCore, "Direct packed E4M3 LUT requires fp8 denominator accumulation.");
 
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
@@ -76,9 +77,16 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   constexpr uint32_t V_SMEM_STRIDE = CTA_K;
 
   extern __shared__ int8_t smem[];
+  __shared__ unsigned char softmax_e4m3_lut[math::kSoftmaxE4M3Lut64Entries];
 
   const uint32_t lane_id = get_lane_id();
   const uint32_t warp_id = get_warp_id();
+
+  if constexpr (use_lut_softmax)
+  {
+    math::load_softmax_e4m3_lut64_to_shared(softmax_e4m3_lut);
+  }
+  __syncthreads();
 
   // maximize L2 hit rate
   const uint32_t batch_id = blockIdx.z;
@@ -302,26 +310,41 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     K_idx_lane_base += CTA_K;
 
-    if constexpr (std::is_same<DTypeSVAccum, float>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
-    }
-    else if constexpr (std::is_same<DTypeSVAccum, half>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
-    }
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
-    {
-      accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
-    }
-
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-    RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+    if constexpr (use_lut_softmax)
     {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RS_f8, RO, m, d, sm_scale, softmax_e4m3_lut);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RS_f8, RO, m, d, sm_scale, softmax_e4m3_lut);
+      }
       accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+    }
+    else
+    {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
+      }
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
+      {
+        accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
+      }
+
+      RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+      {
+        accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+      }
     }
 
     __syncthreads();
@@ -410,26 +433,41 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     // apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
     K_idx_lane_base += CTA_K;
 
-    if constexpr (std::is_same<DTypeSVAccum, float>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
-    }
-    else if constexpr (std::is_same<DTypeSVAccum, half>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
-    }
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
-    {
-      accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
-    }
-
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-    RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+    if constexpr (use_lut_softmax)
     {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RS_f8, RO, m, d, original_sm_scale, softmax_e4m3_lut);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RS_f8, RO, m, d, original_sm_scale, softmax_e4m3_lut);
+      }
       accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+    }
+    else
+    {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      }
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
+      {
+        accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
+      }
+
+      RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+      {
+        accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+      }
     }
 
     __syncthreads();
@@ -517,26 +555,41 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
     K_idx_lane_base += CTA_K;
 
-    if constexpr (std::is_same<DTypeSVAccum, float>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
-    }
-    else if constexpr (std::is_same<DTypeSVAccum, half>::value)
-    {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
-    }
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
-    {
-      accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
-    }
-
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-    RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
-
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+    if constexpr (use_lut_softmax)
     {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RS_f8, RO, m, d, original_sm_scale, softmax_e4m3_lut);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo_pack_f8_lut64<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RS_f8, RO, m, d, original_sm_scale, softmax_e4m3_lut);
+      }
       accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+    }
+    else
+    {
+      if constexpr (std::is_same<DTypeSVAccum, float>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      }
+      else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+      {
+        update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      }
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
+      {
+        accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
+      }
+
+      RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+      {
+        accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+      }
     }
 
     // ensure V is ready
@@ -702,9 +755,5 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     }
   }
 }
-
-
-
-
 
 
