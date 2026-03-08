@@ -44,6 +44,8 @@ def simulate_quantization(x: torch.Tensor, precision: str) -> torch.Tensor:
         return x.to(torch.float32), 1.0
     elif precision == 'FP16':
         return x.to(torch.float16), 1.0
+    elif precision == 'BF16':
+        return x.to(torch.bfloat16), 1.0
     elif precision == 'INT8':
         return dynamic_quantize_int(x, bits=8)
     elif precision == 'INT4':
@@ -105,13 +107,15 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     
     S_q = Q_q @ K_q.transpose(-2, -1) * Q_scale * K_scale / math.sqrt(head_dim)
     P_q = F.softmax(S_q, dim=-1)
+    del Q_q, K_q
+    import ipdb; ipdb.set_trace()
+    # torch.save(P_q, "P_q_fp16.pt")
     
     # PV 阶段量化 (P是注意力权重，V是Value)
     P_qq, P_scale = simulate_quantization(P_q, pv_precision)
     V_q, V_scale = simulate_quantization(V_ref, pv_precision)
-    # import ipdb; ipdb.set_trace()
     # O_q = P_qq @ V_q
-    if pv_precision == "FP16" or pv_precision == "INT8":
+    if pv_precision == "FP16" or pv_precision == "BF16" or pv_precision == "INT8":
         O_q = torch.bmm(P_qq, V_q) * P_scale * V_scale  # 还原缩放
     else:
         O_q = torch.bmm(P_qq.to(torch.float32), V_q.to(torch.float32)) * P_scale * V_scale  # 还原缩放
@@ -164,13 +168,15 @@ if __name__ == "__main__":
         # 测试不同的精度组合配置
         configs = [
             {"qk": "INT8", "pv": "FP16"},
-            {"qk": "INT8", "pv": "FP8_E4M3"},
-            {"qk": "INT8", "pv": "FP8_E5M2"},
-            {"qk": "INT8", "pv": "INT8"},
+            {"qk": "INT8", "pv": "BF16"},
+            # {"qk": "INT8", "pv": "FP8_E4M3"},
+            # {"qk": "INT8", "pv": "FP8_E5M2"},
+            # {"qk": "INT8", "pv": "INT8"},
             {"qk": "INT4", "pv": "FP16"},
-            {"qk": "INT4", "pv": "FP8_E4M3"},
-            {"qk": "INT4", "pv": "FP8_E5M2"},
-            {"qk": "INT4", "pv": "INT8"},
+            {"qk": "INT4", "pv": "BF16"},
+            # {"qk": "INT4", "pv": "FP8_E4M3"},
+            # {"qk": "INT4", "pv": "FP8_E5M2"},
+            # {"qk": "INT4", "pv": "INT8"},
         ]
         
         with torch.no_grad():
