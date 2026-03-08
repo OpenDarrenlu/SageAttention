@@ -19,13 +19,14 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
+def _attn_fwd_inner(debug_ptr, acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
                     start_m, mask_ptrs, stride_maskn,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
                     ):
     lo, hi = 0, kv_len
+    time_qk, time_mask, time_softmax, time_pv = tl.cast(0, tl.int64), tl.cast(0, tl.int64), tl.cast(0, tl.int64), tl.cast(0, tl.int64)
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_block = None
@@ -42,7 +43,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             k = tl.load(K_ptrs, mask=k_mask)
             k_scale = tl.load(K_scale_ptr)
 
+            t0 = get_clock()
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
+            t1 = get_clock()
             
             if mask_block is not None:
                 if mask_block.dtype == tl.int1:
@@ -51,9 +54,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     qk = qk + mask_block
             else:
                 qk += tl.where(k_mask, 0, -1.0e6)
-
+            
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk = qk - m_ij[:, None]
+            t2 = get_clock()
+            
             p = tl.math.exp2(qk)
             l_ij = tl.sum(p, 1)
             
@@ -61,19 +66,48 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             l_i = l_i * alpha + l_ij
             
             acc = acc * alpha[:, None]
+            t3 = get_clock()
             
             v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
             p = p.to(tl.float16)
+            t4 = get_clock()
             
-            acc += tl.dot(p, v, out_dtype=tl.float16)   
+            acc += tl.dot(p, v, out_dtype=tl.float16)
+            t5 = get_clock()
+            
+            time_qk += t1 - t0
+            time_mask += t2 - t1
+            time_softmax += t3 - t2
+            time_pv += t5 - t4
+            
             m_i = m_ij
         K_ptrs += BLOCK_N * stride_kn
         K_scale_ptr += 1
         V_ptrs += BLOCK_N * stride_vn
+    tl.store(debug_ptr + tl.program_id(0) * 4, time_qk)
+    tl.store(debug_ptr + tl.program_id(0) * 4 + 1, time_mask)
+    tl.store(debug_ptr + tl.program_id(0) * 4 + 2, time_softmax)
+    tl.store(debug_ptr + tl.program_id(0) * 4 + 3, time_pv)
+    
     return acc, l_i, m_i
 
+# 定义获取硬件周期的辅助函数
 @triton.jit
-def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
+def get_clock():
+    # 使用内联 PTX 汇编读取 %clock64 寄存器
+    # constraints="=l" 表示输出是一个 64-bit 的整型寄存器
+    # is_pure=False 告诉编译器这是一个有副作用的操作，防止被过度优化掉
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %clock64;",
+        "=l", 
+        [],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1
+    )
+    
+@triton.jit
+def _attn_fwd(debug_ptr, Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
               stride_qz, stride_qh, stride_qn,
               stride_kz, stride_kh, stride_kn,  
               stride_vz, stride_vh, stride_vn,  
@@ -114,7 +148,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
+    acc, l_i, m_i = _attn_fwd_inner(debug_ptr, acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                     start_m, mask_ptrs, stride_maskn,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n 
@@ -167,7 +201,10 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
+    debug_ptr = torch.empty([b, h_qo, (qo_len + BLOCK_M - 1)//BLOCK_M, 4], dtype=torch.int64, device=q.device)
+    
     _attn_fwd[grid](
+        debug_ptr,
         q, k, v, q_scale, k_scale, o, attn_mask, lse,
         stride_bz_q, stride_h_q, stride_seq_q, 
         stride_bz_k, stride_h_k, stride_seq_k,  
@@ -180,5 +217,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
         STAGE=stage, RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4)
-
+    # print(debug_ptr)
+    print(debug_ptr.reshape(-1, 4)[:1])
+    
     return o, lse

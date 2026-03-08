@@ -274,6 +274,9 @@ def sageattn_qk_int8_pv_fp16_triton(
     seq_dim = 1 if tensor_layout == "NHD" else 2
     nh_dim = 2 if tensor_layout == "NHD" else 1
 
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+    starter.record()
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
         nqheads = q.size(nh_dim)
@@ -291,6 +294,9 @@ def sageattn_qk_int8_pv_fp16_triton(
                 lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1).to(torch.float32)
     else:
         km = None
+    ender.record()
+    torch.cuda.synchronize()
+    print(f"smooth_k: {smooth_k}, time: {starter.elapsed_time(ender)} ms")
 
     if dtype == torch.bfloat16 or dtype == torch.float32:
         v = v.to(torch.float16)
@@ -298,12 +304,18 @@ def sageattn_qk_int8_pv_fp16_triton(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
+    starter.record()
     if quantization_backend == "triton":
         q_int8, q_scale, k_int8, k_scale = per_block_int8_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     elif quantization_backend == "cuda":
         q_int8, q_scale, k_int8, k_scale = per_block_int8_cuda(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     else:
         raise ValueError(f"Unsupported quantization backend: {quantization_backend}")
+    ender.record()
+    torch.cuda.synchronize()
+    print(f"per_block_int8, backend: {quantization_backend}, time: {starter.elapsed_time(ender)} ms")
+    
+    starter.record()
     if is_causal:
         assert attn_mask is None, "Mask should be None for causal attention."
         o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
@@ -320,7 +332,10 @@ def sageattn_qk_int8_pv_fp16_triton(
             except Exception:
                 raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
         o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
-
+    ender.record()
+    torch.cuda.synchronize()
+    print(f"attn, is_causal: {is_causal}, time: {starter.elapsed_time(ender)} ms")
+    
     o = o[..., :head_dim_og]
 
     if return_lse:
