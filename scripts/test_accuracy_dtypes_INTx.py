@@ -17,37 +17,10 @@ def dynamic_quantize_int(x: torch.Tensor, bits: int) -> torch.Tensor:
     # x_dq = x_q * scale
     return x_q, scale
 
-def dynamic_quantize_fp8(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """动态 FP8 (E4M3/E5M2) 量化"""
-    # E4M3 最大正常值为 448.0, E5M2 为 57344.0
-    if dtype == torch.float8_e4m3fn:
-        max_val = 448.0
-    elif dtype == torch.float8_e5m2:
-        max_val = 57344.0
-    else:
-        raise ValueError("不支持的 FP8 格式")
-
-    scale = x.abs().max() / max_val
-    if scale == 0:
-        return x
-    
-    # 缩放 -> 转换至 FP8 截断精度 -> 转换回 FP32 并还原缩放
-    x_scaled = x / scale
-    x_fp8 = x_scaled.to(dtype)
-    # scale_tensor = torch.tensor([scale], dtype=torch.float32, device=x.device)
-    # x_dq = x_fp8.to(torch.float32) * scale
-    return x_fp8, scale # scale_tensor
-
 def simulate_quantization(x: torch.Tensor, precision: str) -> torch.Tensor:
     """根据指定的精度对张量进行量化模拟"""
     precision = precision.upper()
-    if precision == 'FP32':
-        return x.to(torch.float32), 1.0
-    elif precision == 'FP16':
-        return x.to(torch.float16), 1.0
-    elif precision == 'BF16':
-        return x.to(torch.bfloat16), 1.0
-    elif precision == 'INT16':
+    if precision == 'INT16':
         data, scale = dynamic_quantize_int(x, bits=16)
         return data.to(torch.int32), scale
     elif precision == 'INT8':
@@ -56,14 +29,9 @@ def simulate_quantization(x: torch.Tensor, precision: str) -> torch.Tensor:
     elif precision == 'INT4':
         data, scale = dynamic_quantize_int(x, bits=4)
         return data.to(torch.int32), scale
-    elif precision == 'FP8_E4M3':
-        if not hasattr(torch, 'float8_e4m3fn'):
-            raise RuntimeError("当前 PyTorch 版本过低，不支持原生的 FP8 数据类型，请升级至 >= 2.1")
-        return dynamic_quantize_fp8(x, torch.float8_e4m3fn)
-    elif precision == 'FP8_E5M2':
-        if not hasattr(torch, 'float8_e5m2'):
-            raise RuntimeError("当前 PyTorch 版本过低，不支持原生的 FP8 数据类型，请升级至 >= 2.1")
-        return dynamic_quantize_fp8(x, torch.float8_e5m2)
+    elif precision == 'INT2':
+        data, scale = dynamic_quantize_int(x, bits=2)
+        return data.to(torch.int32), scale
     else:
         raise ValueError(f"不支持的精度类型: {precision}")
 
@@ -92,9 +60,9 @@ def calculate_metrics(ref_tensor: torch.Tensor, q_tensor: torch.Tensor) -> dict:
     }
 
 def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
-                                    qk_precision: str, pv_precision: str):
+                                    qk_precision: str, p_precision: str, v_precision: str):
     """执行评估流程"""
-    print(f"--- 评估配置: QK={qk_precision}, PV={pv_precision} ---")
+    print(f"--- 评估配置: QK={qk_precision}, P={p_precision}, V={v_precision} ---")
     
     # 确保基准输入为 FP16
     Q_ref, K_ref, V_ref = Q, K, V
@@ -116,7 +84,7 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     if qk_precision == "INT4" or qk_precision == "INT8":
         S_q = torchmm.matmul(Q_q, K_q.transpose(-2, -1)) * Q_scale * K_scale / math.sqrt(head_dim)
     else:
-        S_q = torch.bmm(Q_q, K_q.transpose(-2, -1)) * Q_scale * K_scale / math.sqrt(head_dim)
+        raise ValueError(f"不支持的 QK 精度类型: {qk_precision}")
     P_q = F.softmax(S_q, dim=-1)
     del Q_q, K_q
     # import ipdb; ipdb.set_trace()
@@ -131,24 +99,13 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     # P_q[P_q < 2**(-40)] = 0
     
     # PV 阶段量化 (P是注意力权重，V是Value)
-    P_qq, P_scale = simulate_quantization(P_q, pv_precision)
-    V_q, V_scale = simulate_quantization(V_ref, pv_precision)
+    P_qq, P_scale = simulate_quantization(P_q, p_precision)
+    V_q, V_scale = simulate_quantization(V_ref, v_precision)
     # O_q = P_qq @ V_q
-    O_q = torch.zeros_like(O_ref)
-    if pv_precision == "FP16" or pv_precision == "BF16":
-        O_q = torch.bmm(P_qq, V_q) * P_scale * V_scale  # 还原缩放
-    elif pv_precision == "INT8" or pv_precision == "INT16":
+    if p_precision == "INT8" or p_precision == "INT16":
         O_q = torchmm.matmul(P_qq, V_q) * P_scale * V_scale  # 还原缩放
     else:
-        O_q = torch.bmm(P_qq.to(torch.float32), V_q.to(torch.float32)) * P_scale * V_scale  # 还原缩放
-        O_q = O_q.to(torch.float16)
-        # O_q = torch.nn.functional.scaled_mm(
-        #               P_qq,
-        #               V_q,
-        #               scale_a=P_scale,
-        #               scale_b=V_scale,
-        #               out_dtype=torch.float16 # 指定输出类型为 FP16
-        #               )
+        raise ValueError(f"不支持的 P 精度类型: {p_precision}")
     
     # ================= 3. 评估指标计算 =================
     metrics = calculate_metrics(O_ref.to(torch.float32), O_q.to(torch.float32))
@@ -189,20 +146,20 @@ if __name__ == "__main__":
         
         # 测试不同的精度组合配置
         configs = [
-            {"qk": "INT8", "pv": "FP16"},
-            {"qk": "INT8", "pv": "BF16"},
-            {"qk": "INT8", "pv": "FP8_E4M3"},
-            {"qk": "INT8", "pv": "FP8_E5M2"},
-            {"qk": "INT8", "pv": "INT8"},
-            {"qk": "INT8", "pv": "INT16"},
-            {"qk": "INT4", "pv": "FP16"},
-            {"qk": "INT4", "pv": "BF16"},
-            {"qk": "INT4", "pv": "FP8_E4M3"},
-            {"qk": "INT4", "pv": "FP8_E5M2"},
-            {"qk": "INT4", "pv": "INT8"},
-            {"qk": "INT4", "pv": "INT16"},
+            {"qk": "INT8", "p": "INT16", "v": "INT16"},
+            {"qk": "INT8", "p": "INT16", "v": "INT8"},
+            {"qk": "INT8", "p": "INT16", "v": "INT4"},
+            {"qk": "INT8", "p": "INT16", "v": "INT2"},
+            # {"qk": "INT8", "p": "INT8", "v": "INT16"},
+            # {"qk": "INT8", "p": "INT8", "v": "INT8"},
+            {"qk": "INT4", "p": "INT16", "v": "INT16"},
+            {"qk": "INT4", "p": "INT16", "v": "INT8"},
+            {"qk": "INT4", "p": "INT16", "v": "INT4"},
+            {"qk": "INT4", "p": "INT16", "v": "INT2"},
+            # {"qk": "INT4", "p": "INT8", "v": "INT16"},
+            # {"qk": "INT4", "p": "INT8", "v": "INT8"},
         ]
         
         with torch.no_grad():
             for cfg in configs:
-                evaluate_attention_quantization(Q, K, V, qk_precision=cfg["qk"], pv_precision=cfg["pv"])
+                evaluate_attention_quantization(Q, K, V, qk_precision=cfg["qk"], p_precision=cfg["p"], v_precision=cfg["v"])
