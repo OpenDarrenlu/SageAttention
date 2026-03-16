@@ -55,7 +55,7 @@ def main(pt_file, bins=100, output_img="histogram.png"):
         raise TypeError(f"不支持的数据类型: {type(tensor)}")
 
     print(f"[*] 数据总数: {tensor.numel()} 个元素")
-    # import ipdb; ipdb.set_trace()
+    import ipdb; ipdb.set_trace()
     tensor_exponent = get_bfloat16_exponent(tensor)
     # 计算1. 大于0， 2. 等于0，3. [-8，0) 4. 等于-9，5. [-20, -10], 6. [-40,-20) ,7. 小于-40的数量比例
     greater_than_0 = (tensor_exponent > 0).sum().item()

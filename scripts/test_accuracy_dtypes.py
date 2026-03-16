@@ -1,4 +1,5 @@
 import torch
+import torchmm
 import torch.nn.functional as F
 import math
 import os
@@ -46,10 +47,15 @@ def simulate_quantization(x: torch.Tensor, precision: str) -> torch.Tensor:
         return x.to(torch.float16), 1.0
     elif precision == 'BF16':
         return x.to(torch.bfloat16), 1.0
+    elif precision == 'INT16':
+        data, scale = dynamic_quantize_int(x, bits=16)
+        return data.to(torch.int32), scale
     elif precision == 'INT8':
-        return dynamic_quantize_int(x, bits=8)
+        data, scale = dynamic_quantize_int(x, bits=8)
+        return data.to(torch.int32), scale
     elif precision == 'INT4':
-        return dynamic_quantize_int(x, bits=4)
+        data, scale = dynamic_quantize_int(x, bits=4)
+        return data.to(torch.int32), scale
     elif precision == 'FP8_E4M3':
         if not hasattr(torch, 'float8_e4m3fn'):
             raise RuntimeError("当前 PyTorch 版本过低，不支持原生的 FP8 数据类型，请升级至 >= 2.1")
@@ -105,18 +111,34 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     Q_q, Q_scale = simulate_quantization(Q_ref, qk_precision)
     K_q, K_scale = simulate_quantization(K_ref, qk_precision)
     
-    S_q = Q_q @ K_q.transpose(-2, -1) * Q_scale * K_scale / math.sqrt(head_dim)
+    # S_q = Q_q @ K_q.transpose(-2, -1) * Q_scale * K_scale / math.sqrt(head_dim)
+    # S_q = torch.zeros((Q_q.size(0), Q_q.size(1), K_q.size(1)), device=Q_q.device)
+    if qk_precision == "INT4" or qk_precision == "INT8":
+        S_q = torchmm.matmul(Q_q, K_q.transpose(-2, -1)) * Q_scale * K_scale / math.sqrt(head_dim)
+    else:
+        S_q = torch.bmm(Q_q, K_q.transpose(-2, -1)) * Q_scale * K_scale / math.sqrt(head_dim)
     P_q = F.softmax(S_q, dim=-1)
     del Q_q, K_q
-    import ipdb; ipdb.set_trace()
+    # import ipdb; ipdb.set_trace()
     # torch.save(P_q, "P_q_fp16.pt")
+    # P_q[P_q < 2**(-5)] = 0
+    # P_q[P_q < 2**(-10)] = 0
+    # P_q[P_q < 2**(-13)] = 0
+    # P_q[P_q < 2**(-14)] = 0
+    # P_q[P_q < 2**(-15)] = 0
+    # P_q[P_q < 2**(-20)] = 0
+    # P_q[P_q < 2**(-30)] = 0
+    # P_q[P_q < 2**(-40)] = 0
     
     # PV 阶段量化 (P是注意力权重，V是Value)
     P_qq, P_scale = simulate_quantization(P_q, pv_precision)
     V_q, V_scale = simulate_quantization(V_ref, pv_precision)
     # O_q = P_qq @ V_q
-    if pv_precision == "FP16" or pv_precision == "BF16" or pv_precision == "INT8":
+    O_q = torch.zeros_like(O_ref)
+    if pv_precision == "FP16" or pv_precision == "BF16":
         O_q = torch.bmm(P_qq, V_q) * P_scale * V_scale  # 还原缩放
+    elif pv_precision == "INT8" or pv_precision == "INT16":
+        O_q = torchmm.matmul(P_qq, V_q) * P_scale * V_scale  # 还原缩放
     else:
         O_q = torch.bmm(P_qq.to(torch.float32), V_q.to(torch.float32)) * P_scale * V_scale  # 还原缩放
         O_q = O_q.to(torch.float16)
@@ -162,21 +184,23 @@ if __name__ == "__main__":
 
     for PT_FILE_PATH in tensor_paths:
         # 加载数据
-        # Q, K, V = load_or_generate_data(pt_path=None) # 将 None 换成 PT_FILE_PATH 即可读取文件
-        Q, K, V = load_or_generate_data(pt_path=PT_FILE_PATH) # 将 None 换成 PT_FILE_PATH 即可读取文件
+        Q, K, V = load_or_generate_data(pt_path=None) # 将 None 换成 PT_FILE_PATH 即可读取文件
+        # Q, K, V = load_or_generate_data(pt_path=PT_FILE_PATH) # 将 None 换成 PT_FILE_PATH 即可读取文件
         
         # 测试不同的精度组合配置
         configs = [
             {"qk": "INT8", "pv": "FP16"},
             {"qk": "INT8", "pv": "BF16"},
-            # {"qk": "INT8", "pv": "FP8_E4M3"},
-            # {"qk": "INT8", "pv": "FP8_E5M2"},
-            # {"qk": "INT8", "pv": "INT8"},
+            {"qk": "INT8", "pv": "FP8_E4M3"},
+            {"qk": "INT8", "pv": "FP8_E5M2"},
+            {"qk": "INT8", "pv": "INT8"},
+            {"qk": "INT8", "pv": "INT16"},
             {"qk": "INT4", "pv": "FP16"},
             {"qk": "INT4", "pv": "BF16"},
-            # {"qk": "INT4", "pv": "FP8_E4M3"},
-            # {"qk": "INT4", "pv": "FP8_E5M2"},
-            # {"qk": "INT4", "pv": "INT8"},
+            {"qk": "INT4", "pv": "FP8_E4M3"},
+            {"qk": "INT4", "pv": "FP8_E5M2"},
+            {"qk": "INT4", "pv": "INT8"},
+            {"qk": "INT4", "pv": "INT16"},
         ]
         
         with torch.no_grad():
