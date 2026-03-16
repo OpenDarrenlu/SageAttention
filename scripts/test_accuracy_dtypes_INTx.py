@@ -4,6 +4,69 @@ import torch.nn.functional as F
 import math
 import os
 
+
+def bf16_to_fixed_point(x_bf16: torch.Tensor):
+    """
+    将 [0, 1) 范围内的 bfloat16 tensor 转换为定点数 (Scale = 1/2^16)
+    返回: 定点数tensor (模拟 uint32 存储) 和 scale
+    """
+    # 确保输入是 bfloat16 类型
+    if x_bf16.dtype != torch.bfloat16:
+        print(f"警告: 输入 dtype 为 {x_bf16.dtype}，已转换为 bfloat16")
+        x_bf16 = x_bf16.to(torch.bfloat16)
+
+    # 1. 提取 bf16 的底层位模式
+    # PyTorch 无法直接对浮点数做位运算，需 view 成 int16。
+    # 转为 int32 并按位与 0xFFFF 是为了避免负数符号扩展带来的干扰。
+    x_int = x_bf16.view(torch.int16).to(torch.int32) & 0xFFFF
+
+    # 提取8位 exponent (去掉符号位，[0,1)的数据符号位为0)
+    # exponent 位于第 [7:14] 位
+    raw_exponent = (x_int >> 7) & 0xFF
+
+    # 提取7位 mantissa
+    mantissa = x_int & 0x7F
+    del x_int  # 不再需要 x_int
+
+    # mantissa 加上默认的 1 (即第7位置为1)
+    m_int = mantissa | 0x80
+    del mantissa  # 不再需要 mantissa
+
+    # 还原真实 exponent (减去 bias 127)
+    exponent = raw_exponent - 127
+    del raw_exponent  # 不再需要 raw_exponent
+    
+    # 使用 int32 模拟 uint32 存储
+    exponent_tensor = exponent.to(torch.int32)
+    m_int_tensor = m_int.to(torch.int32)
+    del exponent, m_int  # 不再需要 exponent 和 m_int
+
+    # 2. 定点化移位操作
+    # 基础移位量
+    shift = exponent_tensor + 9
+
+    # 初始化输出 tensor 为 0 (这也自动处理了 exponent < -15 等"其他"情况)
+    out_fixed = torch.zeros_like(m_int_tensor, dtype=torch.int32)
+
+    # 划分掩码条件
+    mask_left  = (exponent_tensor >= -9) & (exponent_tensor <= -1)
+    mask_right = (exponent_tensor >= -15) & (exponent_tensor <= -10)
+    del exponent_tensor  # 不再需要 exponent_tensor
+
+    # 对 exponent 在 [-9, -1] 范围的数进行左移
+    out_fixed[mask_left] = m_int_tensor[mask_left] << shift[mask_left]
+
+    # 对 exponent 在 [-15, -10] 范围的数进行右移（注意 shift 为负数，加负号转为正的右移量）
+    # 右移会自动舍去低位 mantissa
+    out_fixed[mask_right] = m_int_tensor[mask_right] >> (-shift[mask_right])
+    del m_int_tensor, shift, mask_left, mask_right  # 不再需要这些中间 tensor
+
+    # 3. 输出定点数与 scale
+    scale = 1 / (2 ** 16)
+
+    return out_fixed, scale
+
+
 def dynamic_quantize_int(x: torch.Tensor, bits: int) -> torch.Tensor:
     """动态对称整数(INT4/INT8)量化"""
     max_val = (1 << (bits - 1)) - 1
@@ -32,6 +95,9 @@ def simulate_quantization(x: torch.Tensor, precision: str) -> torch.Tensor:
     elif precision == 'INT2':
         data, scale = dynamic_quantize_int(x, bits=2)
         return data.to(torch.int32), scale
+    elif precision == 'PINT':
+        data, scale = bf16_to_fixed_point(x)
+        return data.to(torch.int32), scale
     else:
         raise ValueError(f"不支持的精度类型: {precision}")
 
@@ -48,10 +114,14 @@ def calculate_metrics(ref_tensor: torch.Tensor, q_tensor: torch.Tensor) -> dict:
     if mean_abs_ref == 0:
         rel_l1 = 0.0
     else:
-        rel_l1 = (torch.abs(ref_flat - q_flat).mean() / mean_abs_ref).item()
-        
+        diff_l1 = ref_flat - q_flat
+        rel_l1 = (torch.abs(diff_l1).mean() / mean_abs_ref).item()
+        del diff_l1
+    
     # 3. RMSE (均方根误差)
-    rmse = torch.sqrt(torch.mean((ref_flat - q_flat) ** 2)).item()
+    diff_rmse = ref_flat - q_flat
+    rmse = torch.sqrt(torch.mean(diff_rmse ** 2)).item()
+    del diff_rmse, ref_flat, q_flat
     
     return {
         "Cosine Similarity": cos_sim,
@@ -86,7 +156,7 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     else:
         raise ValueError(f"不支持的 QK 精度类型: {qk_precision}")
     P_q = F.softmax(S_q, dim=-1)
-    del Q_q, K_q
+    del Q_q, K_q, S_q  # 同时删除 S_q
     # import ipdb; ipdb.set_trace()
     # torch.save(P_q, "P_q_fp16.pt")
     # P_q[P_q < 2**(-5)] = 0
@@ -100,15 +170,18 @@ def evaluate_attention_quantization(Q: torch.Tensor, K: torch.Tensor, V: torch.T
     
     # PV 阶段量化 (P是注意力权重，V是Value)
     P_qq, P_scale = simulate_quantization(P_q, p_precision)
+    del P_q  # 不再需要 P_q
     V_q, V_scale = simulate_quantization(V_ref, v_precision)
     # O_q = P_qq @ V_q
-    if p_precision == "INT8" or p_precision == "INT16":
+    if p_precision == "INT8" or p_precision == "INT16" or p_precision == "PINT":
         O_q = torchmm.matmul(P_qq, V_q) * P_scale * V_scale  # 还原缩放
     else:
         raise ValueError(f"不支持的 P 精度类型: {p_precision}")
+    del P_qq, V_q, P_scale, V_scale  # 不再需要这些中间 tensor
     
     # ================= 3. 评估指标计算 =================
     metrics = calculate_metrics(O_ref.to(torch.float32), O_q.to(torch.float32))
+    del O_ref, O_q  # 不再需要 O_ref 和 O_q
     for k, v in metrics.items():
         print(f"  {k}: {v:.6f}")
     print("\n")
@@ -146,16 +219,24 @@ if __name__ == "__main__":
         
         # 测试不同的精度组合配置
         configs = [
-            {"qk": "INT8", "p": "INT16", "v": "INT16"},
-            {"qk": "INT8", "p": "INT16", "v": "INT8"},
-            {"qk": "INT8", "p": "INT16", "v": "INT4"},
-            {"qk": "INT8", "p": "INT16", "v": "INT2"},
+            {"qk": "INT8", "p": "PINT", "v": "INT16"},
+            {"qk": "INT8", "p": "PINT", "v": "INT8"},
+            {"qk": "INT8", "p": "PINT", "v": "INT4"},
+            
+            {"qk": "INT4", "p": "PINT", "v": "INT16"},
+            {"qk": "INT4", "p": "PINT", "v": "INT8"},
+            {"qk": "INT4", "p": "PINT", "v": "INT4"},
+            
+            # {"qk": "INT8", "p": "INT16", "v": "INT16"},
+            # {"qk": "INT8", "p": "INT16", "v": "INT8"},
+            # {"qk": "INT8", "p": "INT16", "v": "INT4"},
+            # {"qk": "INT8", "p": "INT16", "v": "INT2"},
             # {"qk": "INT8", "p": "INT8", "v": "INT16"},
             # {"qk": "INT8", "p": "INT8", "v": "INT8"},
-            {"qk": "INT4", "p": "INT16", "v": "INT16"},
-            {"qk": "INT4", "p": "INT16", "v": "INT8"},
-            {"qk": "INT4", "p": "INT16", "v": "INT4"},
-            {"qk": "INT4", "p": "INT16", "v": "INT2"},
+            # {"qk": "INT4", "p": "INT16", "v": "INT16"},
+            # {"qk": "INT4", "p": "INT16", "v": "INT8"},
+            # {"qk": "INT4", "p": "INT16", "v": "INT4"},
+            # {"qk": "INT4", "p": "INT16", "v": "INT2"},
             # {"qk": "INT4", "p": "INT8", "v": "INT16"},
             # {"qk": "INT4", "p": "INT8", "v": "INT8"},
         ]
