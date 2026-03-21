@@ -7,7 +7,7 @@ import argparse
 from diffusers.utils import export_to_video
 from modify_model.modify_wan import set_sage_attn_wan
 from tqdm import tqdm
-from sageattention import sageattn
+from sageattention import sageattn, sageattn_pint
 
 def normal_attn(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False):
     attn_weights = torch.matmul(query, key.transpose(-1, -2))
@@ -23,12 +23,13 @@ def normal_attn(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fals
 ATTNENTION = {
     "sage": sageattn,
     "sdpa": F.scaled_dot_product_attention,
+    "sage_pint": sageattn_pint,
 }
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX1.5-5B", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
-parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage'], help='Attention type')
+parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'sage_pint'], help='Attention type')
 args = parser.parse_args()
 
 
@@ -38,7 +39,8 @@ prompt = "A serene night scene in a forested area. The first frame shows a tranq
 torch.manual_seed(42)
 
 # Available models: Wan-AI/Wan2.1-I2V-14B-720P-Diffusers or Wan-AI/Wan2.1-I2V-14B-480P-Diffusers
-model_id = "../../Wan2.1-T2V-1.3B-Diffusers" # query shape: torch.Size([1, 12, 14040, 128]), key shape: torch.Size([1, 12, 14040, 128]), value shape: torch.Size([1, 12, 14040, 128])
+# model_id = "../../Wan2.1-T2V-1.3B-Diffusers" # query shape: torch.Size([1, 12, 14040, 128]), key shape: torch.Size([1, 12, 14040, 128]), value shape: torch.Size([1, 12, 14040, 128])
+model_id = args.model_path
 
 pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 # pipe.enable_model_cpu_offload()
@@ -46,8 +48,8 @@ pipe = WanPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
 if args.compile:
     pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune-no-cudagraphs")
 
-# set_sage_attn_wan(pipe.transformer, ATTNENTION[args.attention_type])
-set_sage_attn_wan(pipe.transformer, normal_attn)
+set_sage_attn_wan(pipe.transformer, ATTNENTION[args.attention_type])
+# set_sage_attn_wan(pipe.transformer, normal_attn)
 
 with torch.autocast("cuda", torch.bfloat16, cache_enabled=False):
     video = pipe(prompt=prompt, negative_prompt=None, num_frames=33).frames[0]

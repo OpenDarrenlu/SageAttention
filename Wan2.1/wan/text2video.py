@@ -38,7 +38,8 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
-        use_delSubnorm=False
+        use_delSubnorm=False,
+        use_pint=True
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -138,6 +139,13 @@ class WanT2V:
                 return output
             for block in self.model.blocks:
                 block.self_attn.attn_func = normal_attn
+                self.sp_size = 1
+        elif use_pint:
+            def pint_attn(q, k, v, k_lens=None, window_size=None):
+                from sageattention import sageattn, sageattn_pint
+                return sageattn_pint(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD").to(q.dtype)
+            for block in self.model.blocks:
+                block.self_attn.attn_func = pint_attn
                 self.sp_size = 1
         else:
             self.sp_size = 1

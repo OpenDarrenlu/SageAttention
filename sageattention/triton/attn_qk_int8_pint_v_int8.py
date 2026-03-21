@@ -17,7 +17,7 @@ limitations under the License.
 import torch, math
 import triton
 import triton.language as tl
-from .quant_pint import bf16_to_fixed_point
+from .quant_pint import bf16_to_fixed_point, bf16_to_fixed_point_s8 
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
@@ -68,9 +68,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             v_scale = tl.load(V_scale_ptr)
             
             p = p.to(tl.bfloat16)
-            p_pint, p_scale = bf16_to_fixed_point(p)
+            p_hi_s8, p_lo_s8 = bf16_to_fixed_point_s8(p)
+            p_scale = 1.0 / (2 ** 16)
             
-            acc += tl.dot(p_pint, v.to(tl.int32), out_dtype=tl.int32).to(tl.float32) * p_scale * v_scale
+            # acc += tl.dot(p_pint, v.to(tl.int32), out_dtype=tl.int32).to(tl.float32) * p_scale * v_scale
+            acc += (tl.dot(p_hi_s8, v)<<8 + tl.dot(p_lo_s8, v) + 32896 * tl.sum(v, 0)).to(tl.float32) * p_scale * v_scale
 
             m_i = m_ij
         K_ptrs += BLOCK_N * stride_kn

@@ -74,7 +74,7 @@ def sageattn_pint(
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
-    if arch == "sm86":
+    if True: # arch == "sm86":
         return sageattn_qk_int8_p_pint_vint8_triton(q, k, v, tensor_layout=tensor_layout, sm_scale=sm_scale, return_lse=return_lse, smooth_k=True)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")

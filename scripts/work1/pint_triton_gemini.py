@@ -102,6 +102,7 @@ def bf16_to_fixed_point_triton(x_bf16: torch.Tensor):
     """
     assert x_bf16.is_cuda and x_bf16.is_contiguous(), "输入 Tensor 必须在 GPU 上且内存连续"
     if x_bf16.dtype != torch.bfloat16:
+        print("输入 Tensor 类型不是 bfloat16，已转换为 bfloat16")
         x_bf16 = x_bf16.to(torch.bfloat16)
 
     n_elements = x_bf16.numel()
@@ -138,9 +139,17 @@ def test_correctness():
         x[1] = 0.0
         x[2] = 0.0001
         
-        out_pt, _ = bf16_to_fixed_point_pt(x)
-        out_tr, _ = bf16_to_fixed_point_triton(x)
+        out_tr, scale = bf16_to_fixed_point_triton(x)
+        # test out_tr * scale == x
+        is_close = (out_tr * scale == x.to(torch.float32))
+        if not is_close.all():
+            print("Triton 输出与 PyTorch 输出不一致")
+            print("max diff ", torch.max(torch.abs(out_tr * scale - x.to(torch.float32))))
+            
+        # print("Triton 输出:", out_tr)
+        assert (out_tr < 2**16).all(), "Triton 输出超出范围"
         
+        out_pt, _ = bf16_to_fixed_point_pt(x)
         is_correct = torch.equal(out_pt, out_tr)
         print(f"Size {N:<8}: {'✅ Passed' if is_correct else '❌ Failed'}")
         

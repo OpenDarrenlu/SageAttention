@@ -155,6 +155,12 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to use delSubnorm attention.")
+    
+    parser.add_argument(
+        "--use_pint",
+        action="store_true",
+        default=False,
+        help="Whether to use pint attention.")
     parser.add_argument(
         "--dit_fsdp",
         action="store_true",
@@ -372,6 +378,7 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
             use_delSubnorm=args.use_delSubnorm,
+            use_pint=args.use_pint,
         )
 
         logging.info(
