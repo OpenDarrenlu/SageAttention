@@ -34,7 +34,7 @@ def clear_l2_cache(device_id=0):
         del dummy_data
         torch.cuda.empty_cache() # 帮助释放被 PyTorch 缓存的内存
 
-def test_precision_comparison_simple(id=0, seq_len=40960):
+def test_precision_comparison_simple(id=0, seq_len=40960, use_pint=True):
     """
     测试精度对比脚本的简单版本，验证基本功能
     """
@@ -42,7 +42,7 @@ def test_precision_comparison_simple(id=0, seq_len=40960):
     
     try:
         # 导入必要的模块
-        from sageattention.core import sageattn
+        from sageattention import sageattn, sageattn_pint
         from flash_attn.flash_attn_interface import flash_attn_func
         from torch.nn.functional import scaled_dot_product_attention
         import numpy as np
@@ -60,17 +60,17 @@ def test_precision_comparison_simple(id=0, seq_len=40960):
         causal = False
         
         # 生成测试数（HND布局）
-        print(f"生成测试数据: batch_size={batch_size}, seq_len={seq_len}, n_heads={n_heads}, head_dim={head_dim}")
-        q = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
-        k = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
-        v = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
-        # # 从 .pt 文件加载 q, k, v
-        # qkv = torch.load(f'qkv_tensors_30layers/qkv_tensors_{id}.pt')
-        # # import ipdb; ipdb.set_trace()
-        # q,k,v = qkv["query"], qkv["key"], qkv["value"]
-        # q = q.to(dtype=dtype, device='cuda')
-        # k = k.to(dtype=dtype, device='cuda')
-        # v = v.to(dtype=dtype, device='cuda')
+        # print(f"生成测试数据: batch_size={batch_size}, seq_len={seq_len}, n_heads={n_heads}, head_dim={head_dim}")
+        # q = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
+        # k = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
+        # v = torch.randn(batch_size, n_heads, seq_len, head_dim, dtype=dtype, device='cuda')
+        # 从 .pt 文件加载 q, k, v
+        qkv = torch.load(f'qkv_tensors_30layers/qkv_tensors_{id}.pt')
+        # import ipdb; ipdb.set_trace()
+        q,k,v = qkv["query"], qkv["key"], qkv["value"]
+        q = q.to(dtype=dtype, device='cuda')
+        k = k.to(dtype=dtype, device='cuda')
+        v = v.to(dtype=dtype, device='cuda')
         # from fast_hadamard_transform import hadamard_transform
         # # 对 q, k, v 进行 Hadamard 变换
         # import math
@@ -108,7 +108,10 @@ def test_precision_comparison_simple(id=0, seq_len=40960):
             # --- NCU Range: SageAttention ---
             # torch.cuda.nvtx.range_push("SageAttention")
             start_time.record()
-            sage_output = sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
+            if use_pint:
+                sage_output = sageattn_pint(q, k, v, tensor_layout='HND', is_causal=causal)
+            else:
+                sage_output = sageattn(q, k, v, tensor_layout='HND', is_causal=causal)
             # sage_output = sageattn(q_nhd, k_nhd, v_nhd, tensor_layout='NHD', is_causal=causal)
             end_time.record()
             torch.cuda.synchronize()
@@ -144,13 +147,15 @@ def test_precision_comparison_simple(id=0, seq_len=40960):
             sage_output,
             flash_output,
         )
+        SNR = 10 * torch.log10(flash_output.square().mean() / (sage_output - flash_output).square().mean().item())
         
         print(f"\n简单精度指标:")
         print(f"最大绝对误差 (Max Error): {max_error:.8f}")
         print(f"最大相对误差: {rel_error.item():.8f}")
         print(f"Cosine相似度: {cos_sim.mean().item():.8f}")
+        print(f"SNR: {SNR:.8f}")
         with open(f"precision_comparison.txt", "a") as f:
-            f.write(f"{id}\t{max_error:.8f}\t{rel_error.item():.8f}\t{cos_sim.mean().item():.8f}\n")
+            f.write(f"{id}\t{max_error:.8f}\t{rel_error.item():.8f}\t{cos_sim.mean().item():.8f}\t{SNR:.8f}\n")
         
         print("\n精度对比基本功能测试通过!")
         return True

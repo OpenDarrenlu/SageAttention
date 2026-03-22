@@ -142,8 +142,8 @@ class WanT2V:
                 self.sp_size = 1
         elif use_pint:
             def pint_attn(q, k, v, k_lens=None, window_size=None):
-                from sageattention import sageattn, sageattn_pint
-                return sageattn_pint(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD").to(q.dtype)
+                from sageattention import sageattn, sageattn_pint, sageattn_pint_torch
+                return sageattn_pint_torch(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD").to(q.dtype)
             for block in self.model.blocks:
                 block.self_attn.attn_func = pint_attn
                 self.sp_size = 1

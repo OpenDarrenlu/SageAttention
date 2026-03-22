@@ -2,227 +2,421 @@ import torch
 import triton
 import triton.language as tl
 
-@triton.jit
-def _per_channel_int8_kernel(
-    V_ptr, Out_ptr, Scale_ptr, Mean_ptr,
-    stride_v_0, stride_v_1, stride_v_d,
-    stride_o_0, stride_o_1, stride_o_d,
-    stride_s_0, stride_s_1,
-    dim0, dim1, D,
-    SMOOTH_V: tl.constexpr,
-    BLOCK_D: tl.constexpr
-):
-    # 将前两个维度展平为 1D grid
-    pid = tl.program_id(0)
-    
-    # 根据 pid 计算 dim0 和 dim1 的索引
-    idx0 = pid // dim1
-    idx1 = pid % dim1
-    
-    # 计算当前 batch/head 对应的起始内存偏移量
-    v_offset = idx0 * stride_v_0 + idx1 * stride_v_1
-    o_offset = idx0 * stride_o_0 + idx1 * stride_o_1
-    s_offset = idx0 * stride_s_0 + idx1 * stride_s_1
-    
-    # 生成 D 维度的索引和掩码 (防止 head_dim 不是 2 的幂次)
-    d_offsets = tl.arange(0, BLOCK_D)
-    mask = d_offsets < D
-    
-    # 加载向量
-    v_ptrs = V_ptr + v_offset + d_offsets * stride_v_d
-    v = tl.load(v_ptrs, mask=mask, other=0.0).to(tl.float32)
-    
-    # 1. Smooth V (去均值)
-    if SMOOTH_V:
-        # 计算该通道的均值
-        mean = tl.sum(v, axis=0) / D
-        v = tl.where(mask, v - mean, 0.0)
-        # 存储均值
-        tl.store(Mean_ptr + s_offset, mean)
-        
-    # 2. 计算 Scale
-    abs_v = tl.abs(v)
-    max_val = tl.max(abs_v, axis=0)
-    # 防止除以 0 的情况发生
-    scale = tl.maximum(max_val / 127.0, 1e-12)
-    tl.store(Scale_ptr + s_offset, scale)
-    
-    # 3. 量化并限制在 [-128, 127]
-    v_quant = v / scale
-    # 四舍五入 (Round)
-    v_quant = tl.where(v_quant >= 0, v_quant + 0.5, v_quant - 0.5)
-    v_quant = tl.maximum(-128.0, tl.minimum(127.0, v_quant))
-    
-    # 4. 转换为 int8 并写回显存
-    v_quant_int8 = v_quant.to(tl.int8)
-    o_ptrs = Out_ptr + o_offset + d_offsets * stride_o_d
-    tl.store(o_ptrs, v_quant_int8, mask=mask)
-
-
 def per_channel_int8(
-    v: torch.Tensor, 
-    tensor_layout: str = "HND", 
+    v: torch.Tensor,
+    tensor_layout: str ="HND",
+    scale_max: float = 127.0,
     smooth_v: bool = True
 ):
     """
-    针对 3D 张量的最后一个维度(head_dim)进行 per-channel INT8 量化。
-    """
-    assert v.dim() == 3, "输入张量必须是 3D 的"
-    assert v.is_cuda, "输入张量必须在 GPU 上"
-    assert tensor_layout in ["HND", "NHD"], "布局参数必须为 'HND' 或 'NHD'"
-    
-    # 抽象出前两个维度，这样逻辑上无视 HND 或 NHD 差异
-    dim0, dim1, D = v.shape
-    stride_v_0, stride_v_1, stride_v_d = v.stride()
-    
-    # 分配输出内存
-    v_quant = torch.empty_like(v, dtype=torch.int8)
-    stride_o_0, stride_o_1, stride_o_d = v_quant.stride()
-    
-    # 分配 Scale 和 Mean 内存，保留原来的 3D 形状但最后一个维度为 1
-    # 这样它们就能自然继承与 v 对应的内存排布形式
-    stats_shape = (dim0, dim1, 1)
-    scale = torch.empty(stats_shape, device=v.device, dtype=torch.float32)
-    stride_s_0, stride_s_1, _ = scale.stride()
-    
-    mean = None
-    if smooth_v:
-        mean = torch.empty(stats_shape, device=v.device, dtype=torch.float32)
+    quantize tensor `v` to int8 with per channel quantization.
+    The quantization is done per channel, with the scale value and smooth factor calculated per channel.
 
-    # 寻找大于等于 D 的下一个 2 的幂次方，用于分配 Shared Memory 大小
-    BLOCK_D = triton.next_power_of_2(D)
+    Parameters
+    ----------
+    v : torch.Tensor
+        The input tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
+
+    tensor_layout : str
+        The tensor layout, either "HND" or "NHD".
+        Default: "HND".
+
+    scale_max : float
+        The maximum scale value for the quantization. Default is 127.0 (upper bound of INT8 data format).
+
+    smooth_v : bool
+        Whether to smooth the quantized tensor. Default is True.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        A tuple containing:
+        - The quantized tensor `v_int8`. Shape:
+            - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``, with `int8` dtype.
+            - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``, with `int8` dtype.
+        - The scale tensor of `v`. Shape: ``[batch_size, num_kv_heads, head_dim]`` with `float32` dtype.
+        - The mean tensor of `v` along the sequence length dimension. Shape: ``[batch_size, num_kv_heads, head_dim]`` with `float32` dtype.
+
+    Note
+    ----
+    - The tensors `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
+    - The returned mean tensor will be None if `smooth_v` is False. Otherwise it will have dtype ``torch.float32``.
+    """
+    # 验证输入参数
+    assert tensor_layout in ["HND", "NHD"], f"Unsupported tensor layout: {tensor_layout}"
+    assert v.dtype in [torch.float16, torch.bfloat16], f"Unsupported dtype: {v.dtype}"
     
-    # Grid 设为前两个维度的乘积 (通常对应 num_heads * seq_len)
-    grid = lambda meta: (dim0 * dim1, )
+    # 保存原始形状
+    orig_shape = v.shape
+    batch_size = orig_shape[0]
+    head_dim = orig_shape[-1]
     
-    # 启动 Kernel
-    _per_channel_int8_kernel[grid](
-        v, v_quant, scale, mean,
-        stride_v_0, stride_v_1, stride_v_d,
-        stride_o_0, stride_o_1, stride_o_d,
-        stride_s_0, stride_s_1,
-        dim0, dim1, D,
-        SMOOTH_V=smooth_v,
-        BLOCK_D=BLOCK_D
-    )
-    
-    if smooth_v:
-        return v_quant, scale, mean
+    if tensor_layout == "HND":
+        # HND: [batch_size, num_kv_heads, kv_len, head_dim]
+        num_kv_heads = orig_shape[1]
+        kv_len = orig_shape[2]
+        # 重塑为 [batch_size * num_kv_heads, kv_len, head_dim] 以便按通道计算
+        v_reshaped = v.view(batch_size * num_kv_heads, kv_len, head_dim)
     else:
-        return v_quant, scale
+        # NHD: [batch_size, kv_len, num_kv_heads, head_dim]
+        kv_len = orig_shape[1]
+        num_kv_heads = orig_shape[2]
+        # 重塑为 [batch_size * num_kv_heads, kv_len, head_dim] 以便按通道计算
+        v_reshaped = v.permute(0, 2, 1, 3).reshape(batch_size * num_kv_heads, kv_len, head_dim)
     
-# 假设前面的 per_channel_int8 和 _per_channel_int8_kernel 已经定义在上下文中
-# from your_module import per_channel_int8 
+    # 计算统计信息和量化
+    v_quant, scale, mean = _per_channel_int8_triton(v_reshaped, scale_max, smooth_v)
+    
+    # 重塑回原始形状
+    if tensor_layout == "HND":
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    else:
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim).permute(0, 2, 1, 3)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    
+    return v_quant, scale, mean
 
-def per_channel_int8_pytorch(v: torch.Tensor, smooth_v: bool = True):
+
+@triton.jit
+def _get_stats_kernel(
+    V_ptr, Scale_ptr, Mean_ptr,
+    B, M, D,
+    stride_vb, stride_vm, stride_vd,
+    SCALE_MAX: tl.constexpr,
+    SMOOTH_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
     """
-    PyTorch 版本的参考实现，用于正确性对比
+    计算每个通道的均值和最大值，以确定缩放因子
     """
-    v_float = v.clone().float()
+    pid_b = tl.program_id(0)
+    pid_d = tl.program_id(1)
     
-    mean = None
-    if smooth_v:
-        # 计算最后一个维度的均值
-        mean = v_float.mean(dim=-1, keepdim=True)
-        v_float = v_float - mean
+    # 计算批次和通道的偏移量
+    b_offsets = pid_b
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    
+    # 掩码，确保不超出边界
+    d_mask = d_offsets < D
+    
+    if SMOOTH_V:
+        # --- 计算 Mean ---
+        sum_vals = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for m in range(0, M, BLOCK_M):
+            m_offsets = m + tl.arange(0, BLOCK_M)
+            m_mask = m_offsets < M
+            
+            # 加载数据
+            v_ptrs = V_ptr + b_offsets * stride_vb + m_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+            v = tl.load(v_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            sum_vals += tl.sum(v, axis=0)
         
-    # 计算 Scale
-    abs_v = v_float.abs()
-    max_val = abs_v.max(dim=-1, keepdim=True)[0]
-    scale = torch.clamp(max_val / 127.0, min=1e-12)
-    
-    # 量化
-    v_quant = v_float / scale
-    # 模拟 Triton 中使用的四舍五入逻辑
-    v_quant = torch.where(v_quant >= 0, torch.floor(v_quant + 0.5), torch.ceil(v_quant - 0.5))
-    v_quant = torch.clamp(v_quant, -128.0, 127.0).to(torch.int8)
-    
-    if smooth_v:
-        return v_quant, scale, mean
+        mean = sum_vals / M
+        
+        # --- 中心化并计算 Max(Abs) ---
+        max_abs = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for m in range(0, M, BLOCK_M):
+            m_offsets = m + tl.arange(0, BLOCK_M)
+            m_mask = m_offsets < M
+            
+            # 加载数据
+            v_ptrs = V_ptr + b_offsets * stride_vb + m_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+            v = tl.load(v_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            # 中心化
+            v_centered = v - mean[None, :]
+            max_abs = tl.maximum(max_abs, tl.max(tl.abs(v_centered), axis=0))
+        
+        # 计算缩放因子
+        scale = max_abs / SCALE_MAX
     else:
-        return v_quant, scale
-
-
-def test_correctness():
-    """
-    测试 Triton Kernel 和 PyTorch 结果是否一致
-    """
-    print("=== 开始正确性测试 ===")
-    torch.manual_seed(0)
+        # --- 只计算 Max(Abs) ---
+        max_abs = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for m in range(0, M, BLOCK_M):
+            m_offsets = m + tl.arange(0, BLOCK_M)
+            m_mask = m_offsets < M
+            
+            # 加载数据
+            v_ptrs = V_ptr + b_offsets * stride_vb + m_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+            v = tl.load(v_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            
+            max_abs = tl.maximum(max_abs, tl.max(tl.abs(v), axis=0))
+        
+        # 计算缩放因子
+        scale = max_abs / SCALE_MAX
+        mean = tl.zeros([BLOCK_D], dtype=tl.float32)
     
-    H, N, D = 32, 1024, 128
+    # 确保缩放因子不为零
+    scale = tl.maximum(scale, 1e-9)
     
-    for layout in ["HND", "NHD"]:
-        for smooth in [True, False]:
-            # 生成测试数据
-            if layout == "HND":
-                v = torch.randn((H, N, D), dtype=torch.float16, device='cuda')
-            else: # NHD
-                # 通过 permute 生成 NHD 的 stride
-                v = torch.randn((N, H, D), dtype=torch.float16, device='cuda').permute(1, 0, 2)
-            
-            # PyTorch 结果
-            pt_res = per_channel_int8_pytorch(v, smooth_v=smooth)
-            # Triton 结果
-            triton_res = per_channel_int8(v, tensor_layout=layout, smooth_v=smooth)
-            
-            v_quant_pt, scale_pt = pt_res[0], pt_res[1]
-            v_quant_tr, scale_tr = triton_res[0], triton_res[1]
-            
-            # 验证 Scale (允许一定的浮点误差)
-            scale_diff = torch.max(torch.abs(scale_pt - scale_tr)).item()
-            assert scale_diff < 1e-4, f"Scale 计算不一致! 最大误差: {scale_diff}"
-            
-            # 验证均值 (如果启用了 smooth_v)
-            if smooth:
-                mean_pt, mean_tr = pt_res[2], triton_res[2]
-                mean_diff = torch.max(torch.abs(mean_pt - mean_tr)).item()
-                assert mean_diff < 1e-4, f"Mean 计算不一致! 最大误差: {mean_diff}"
-            
-            # 验证量化结果 (因为浮点精度差异，允许最大 1 的量化误差)
-            quant_diff = torch.max(torch.abs(v_quant_pt.float() - v_quant_tr.float())).item()
-            assert quant_diff <= 1, f"Quantization 计算不一致! 最大误差: {quant_diff}"
-            
-            print(f"✅ Layout: {layout}, Smooth: {smooth} 测试通过!")
+    # 存储结果
+    scale_ptr = Scale_ptr + b_offsets * D + d_offsets
+    tl.store(scale_ptr, scale, mask=d_mask)
+    
+    if SMOOTH_V:
+        mean_ptr = Mean_ptr + b_offsets * D + d_offsets
+        tl.store(mean_ptr, mean, mask=d_mask)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['N'],  # 用作 X 轴的变量：序列长度 seq_len
-        x_vals=[128, 256, 512, 1024, 2048, 4096], # 测试不同的序列长度
-        line_arg='provider', # 用作线条的变量（区分 PyTorch 和 Triton）
-        line_vals=['pytorch', 'triton'], # 线条的值
-        line_names=['PyTorch', 'Triton'], # 图例名称
-        styles=[('blue', '-'), ('green', '-')], # 线条样式
-        ylabel='Time (ms)', # Y 轴标签
-        plot_name='per_channel_int8_performance', # 图表名称
-        args={'H': 32, 'D': 128} # 其他固定参数：32个Head，head_dim 为 128
+@triton.jit
+def _apply_quant_kernel(
+    V_ptr, Quant_ptr, Scale_ptr, Mean_ptr,
+    B, M, D,
+    stride_vb, stride_vm, stride_vd,
+    stride_qb, stride_qm, stride_qd,
+    SMOOTH_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    应用量化到输入张量
+    """
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_d = tl.program_id(2)
+    
+    # 计算偏移量
+    b_offsets = pid_b
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    
+    # 掩码，确保不超出边界
+    m_mask = m_offsets < M
+    d_mask = d_offsets < D
+    mask = m_mask[:, None] & d_mask[None, :]
+    
+    # 加载数据
+    v_ptrs = V_ptr + b_offsets * stride_vb + m_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+    v = tl.load(v_ptrs, mask=mask).to(tl.float32)
+    
+    # 加载缩放因子
+    scale_ptr = Scale_ptr + b_offsets * D + d_offsets
+    scale = tl.load(scale_ptr, mask=d_mask)
+    
+    # 加载均值并中心化（如果需要）
+    if SMOOTH_V:
+        mean_ptr = Mean_ptr + b_offsets * D + d_offsets
+        mean = tl.load(mean_ptr, mask=d_mask)
+        v = v - mean[None, :]
+    
+    # 应用量化
+    q = v / scale[None, :]
+    q += 0.5 * tl.where(q >= 0, 1, -1)  # 模拟四舍五入
+    
+    # 存储量化结果
+    q_ptrs = Quant_ptr + b_offsets * stride_qb + m_offsets[:, None] * stride_qm + d_offsets[None, :] * stride_qd
+    tl.store(q_ptrs, q.to(tl.int8), mask=mask)
+
+
+def _per_channel_int8_triton(v: torch.Tensor, scale_max: float, smooth_v: bool):
+    """
+    使用Triton实现的通道级int8量化
+    """
+    v = v.contiguous()
+    B, M, D = v.shape  # B: batch_size * num_kv_heads, M: kv_len, D: head_dim
+    
+    # 分配输出张量
+    scale = torch.empty((B, D), dtype=torch.float32, device=v.device)
+    mean = torch.empty((B, D), dtype=torch.float32, device=v.device) if smooth_v else None
+    v_quant = torch.empty_like(v, dtype=torch.int8)
+    
+    # 配置Triton内核参数
+    BLOCK_M_1 = 1024
+    BLOCK_D_1 = triton.next_power_of_2(D) if D <= 64 else 64
+    grid_1 = (B, triton.cdiv(D, BLOCK_D_1))
+    
+    dummy_mean = mean if smooth_v else scale
+    
+    # 计算统计信息
+    _get_stats_kernel[grid_1](
+        v, scale, dummy_mean,
+        B, M, D,
+        v.stride(0), v.stride(1), v.stride(2),
+        SCALE_MAX=scale_max,
+        SMOOTH_V=smooth_v,
+        BLOCK_M=BLOCK_M_1,
+        BLOCK_D=BLOCK_D_1,
     )
-)
-def benchmark(N, H, D, provider):
-    """
-    性能基准测试
-    """
-    v = torch.randn((H, N, D), dtype=torch.float16, device='cuda')
-    quantiles = [0.5, 0.2, 0.8] # 返回中位数，以及 20% 和 80% 的分位数
     
-    if provider == 'pytorch':
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: per_channel_int8_pytorch(v, smooth_v=True), 
-            quantiles=quantiles
-        )
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: per_channel_int8(v, tensor_layout="HND", smooth_v=True), 
-            quantiles=quantiles
-        )
-    return ms, max_ms, min_ms
+    # 应用量化
+    BLOCK_M_2 = 128
+    BLOCK_D_2 = BLOCK_D_1
+    grid_2 = (B, triton.cdiv(M, BLOCK_M_2), triton.cdiv(D, BLOCK_D_2))
+    
+    _apply_quant_kernel[grid_2](
+        v, v_quant, scale, dummy_mean,
+        B, M, D,
+        v.stride(0), v.stride(1), v.stride(2),
+        v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
+        SMOOTH_V=smooth_v,
+        BLOCK_M=BLOCK_M_2,
+        BLOCK_D=BLOCK_D_2,
+    )
+    
+    return v_quant, scale, mean if smooth_v else None
+
+
+def per_channel_int8_pytorch(
+    v: torch.Tensor,
+    tensor_layout: str ="HND",
+    scale_max: float = 127.0,
+    smooth_v: bool = True
+):
+    """
+    使用PyTorch实现的通道级int8量化
+    与Triton实现保持数学一致性
+    """
+    # 验证输入参数
+    assert tensor_layout in ["HND", "NHD"], f"Unsupported tensor layout: {tensor_layout}"
+    assert v.dtype in [torch.float16, torch.bfloat16], f"Unsupported dtype: {v.dtype}"
+    
+    # 保存原始形状
+    orig_shape = v.shape
+    batch_size = orig_shape[0]
+    head_dim = orig_shape[-1]
+    
+    if tensor_layout == "HND":
+        # HND: [batch_size, num_kv_heads, kv_len, head_dim]
+        num_kv_heads = orig_shape[1]
+        kv_len = orig_shape[2]
+        # 重塑为 [batch_size * num_kv_heads, kv_len, head_dim] 以便按通道计算
+        v_reshaped = v.view(batch_size * num_kv_heads, kv_len, head_dim)
+    else:
+        # NHD: [batch_size, kv_len, num_kv_heads, head_dim]
+        kv_len = orig_shape[1]
+        num_kv_heads = orig_shape[2]
+        # 重塑为 [batch_size * num_kv_heads, kv_len, head_dim] 以便按通道计算
+        v_reshaped = v.permute(0, 2, 1, 3).reshape(batch_size * num_kv_heads, kv_len, head_dim)
+    
+    # 计算均值（如果需要）
+    mean = None
+    if smooth_v:
+        mean = v_reshaped.mean(dim=1, keepdim=False).float()
+        # 中心化
+        v_centered = v_reshaped - mean.unsqueeze(1)
+    else:
+        v_centered = v_reshaped
+    
+    # 计算每个通道的绝对值最大值
+    abs_max = torch.max(torch.abs(v_centered), dim=1, keepdim=False)[0]
+    
+    # 计算缩放因子
+    scale = abs_max / scale_max
+    scale = torch.clamp(scale, min=1e-9)
+    
+    # 应用量化
+    v_quant = v_centered / scale.unsqueeze(1)
+    # 模拟四舍五入
+    v_quant += 0.5 * torch.where(v_quant >= 0, 1, -1)
+    v_quant = v_quant.to(torch.int8)
+    
+    # 重塑回原始形状
+    if tensor_layout == "HND":
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    else:
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim).permute(0, 2, 1, 3)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    
+    return v_quant, scale, mean
+
 
 if __name__ == "__main__":
-    # 1. 跑正确性测试
-    test_correctness()
-    print("\n")
+    import time
     
-    # 2. 跑性能测试
-    print("=== 开始性能 Benchmark ===")
-    benchmark.run(print_data=True, show_plots=False)
+    # 配置测试参数
+    batch_size = 4
+    num_kv_heads = 32
+    kv_len = 2048
+    head_dim = 128
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print(f"Testing on device: {device}")
+    print(f"Tensor dimensions: batch_size={batch_size}, num_kv_heads={num_kv_heads}, kv_len={kv_len}, head_dim={head_dim}")
+    
+    # 生成测试数据
+    v_hnd = torch.randn((batch_size, num_kv_heads, kv_len, head_dim), device=device, dtype=torch.float16) * 2.5 + 0.5
+    v_nhd = torch.randn((batch_size, kv_len, num_kv_heads, head_dim), device=device, dtype=torch.float16) * 2.5 + 0.5
+    
+    # 测试不同的布局和smooth_v设置
+    test_cases = [
+        ("HND", True),
+        ("HND", False),
+        ("NHD", True),
+        ("NHD", False)
+    ]
+    
+    for layout, smooth in test_cases:
+        print(f"\n=== Testing layout={layout}, smooth_v={smooth} ===")
+        
+        # 选择测试数据
+        v = v_hnd if layout == "HND" else v_nhd
+        
+        # 计算PyTorch版本
+        start = time.time()
+        v_q_pytorch, s_pytorch, m_pytorch = per_channel_int8_pytorch(v, tensor_layout=layout, smooth_v=smooth)
+        torch.cuda.synchronize() if device == "cuda" else None
+        pytorch_time = (time.time() - start) * 1000
+        
+        # 计算Triton版本
+        start = time.time()
+        v_q_triton, s_triton, m_triton = per_channel_int8(v, tensor_layout=layout, smooth_v=smooth)
+        torch.cuda.synchronize() if device == "cuda" else None
+        triton_time = (time.time() - start) * 1000
+        
+        # 计算精度差异
+        diff_q = torch.max(torch.abs(v_q_pytorch.float() - v_q_triton.float())).item()
+        diff_s = torch.max(torch.abs(s_pytorch - s_triton)).item()
+        
+        print(f"PyTorch time: {pytorch_time:.3f} ms")
+        print(f"Triton time: {triton_time:.3f} ms")
+        print(f"Speedup: {pytorch_time / triton_time:.2f}x")
+        print(f"Max quantization difference: {diff_q}")
+        print(f"Max scale difference: {diff_s:.8f}")
+        
+        if smooth:
+            diff_m = torch.max(torch.abs(m_pytorch - m_triton)).item()
+            print(f"Max mean difference: {diff_m:.8f}")
+        
+        # 计算反量化误差
+        if layout == "HND":
+            # HND布局：需要在kv_len维度(维度2)添加广播维度
+            s_pytorch_reshaped = s_pytorch.unsqueeze(2)
+            s_triton_reshaped = s_triton.unsqueeze(2)
+            if smooth:
+                m_pytorch_reshaped = m_pytorch.unsqueeze(2)
+                m_triton_reshaped = m_triton.unsqueeze(2)
+                dequant_error_pytorch = (v_q_pytorch * s_pytorch_reshaped + m_pytorch_reshaped - v).abs().max().item()
+                dequant_error_triton = (v_q_triton * s_triton_reshaped + m_triton_reshaped - v).abs().max().item()
+            else:
+                dequant_error_pytorch = (v_q_pytorch * s_pytorch_reshaped - v).abs().max().item()
+                dequant_error_triton = (v_q_triton * s_triton_reshaped - v).abs().max().item()
+        else:
+            # NHD布局：需要在kv_len维度(维度1)添加广播维度
+            s_pytorch_reshaped = s_pytorch.unsqueeze(1)
+            s_triton_reshaped = s_triton.unsqueeze(1)
+            if smooth:
+                m_pytorch_reshaped = m_pytorch.unsqueeze(1)
+                m_triton_reshaped = m_triton.unsqueeze(1)
+                dequant_error_pytorch = (v_q_pytorch * s_pytorch_reshaped + m_pytorch_reshaped - v).abs().max().item()
+                dequant_error_triton = (v_q_triton * s_triton_reshaped + m_triton_reshaped - v).abs().max().item()
+            else:
+                dequant_error_pytorch = (v_q_pytorch * s_pytorch_reshaped - v).abs().max().item()
+                dequant_error_triton = (v_q_triton * s_triton_reshaped - v).abs().max().item()
+        
+        print(f"Max dequantization error (PyTorch): {dequant_error_pytorch:.8f}")
+        print(f"Max dequantization error (Triton): {dequant_error_triton:.8f}")
+    
+    print("\nAll tests completed!")

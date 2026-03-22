@@ -26,20 +26,20 @@ def bf16_to_fixed_point(x_bf16: torch.Tensor):
 
     # 提取7位 mantissa
     mantissa = x_int & 0x7F
-    del x_int  # 不再需要 x_int
+    # del x_int  # 不再需要 x_int
 
     # mantissa 加上默认的 1 (即第7位置为1)
     m_int = mantissa | 0x80
-    del mantissa  # 不再需要 mantissa
+    # del mantissa  # 不再需要 mantissa
 
     # 还原真实 exponent (减去 bias 127)
     exponent = raw_exponent - 127
-    del raw_exponent  # 不再需要 raw_exponent
+    # del raw_exponent  # 不再需要 raw_exponent
     
     # 使用 int32 模拟 uint32 存储
     exponent_tensor = exponent.to(torch.int32)
     m_int_tensor = m_int.to(torch.int32)
-    del exponent, m_int  # 不再需要 exponent 和 m_int
+    # del exponent, m_int  # 不再需要 exponent 和 m_int
 
     # 2. 定点化移位操作
     # 基础移位量
@@ -51,7 +51,7 @@ def bf16_to_fixed_point(x_bf16: torch.Tensor):
     # 划分掩码条件
     mask_left  = (exponent_tensor >= -9) & (exponent_tensor <= -1)
     mask_right = (exponent_tensor >= -15) & (exponent_tensor <= -10)
-    del exponent_tensor  # 不再需要 exponent_tensor
+    # del exponent_tensor  # 不再需要 exponent_tensor
 
     # 对 exponent 在 [-9, -1] 范围的数进行左移
     out_fixed[mask_left] = m_int_tensor[mask_left] << shift[mask_left]
@@ -59,7 +59,7 @@ def bf16_to_fixed_point(x_bf16: torch.Tensor):
     # 对 exponent 在 [-15, -10] 范围的数进行右移（注意 shift 为负数，加负号转为正的右移量）
     # 右移会自动舍去低位 mantissa
     out_fixed[mask_right] = m_int_tensor[mask_right] >> (-shift[mask_right])
-    del m_int_tensor, shift, mask_left, mask_right  # 不再需要这些中间 tensor
+    # del m_int_tensor, shift, mask_left, mask_right  # 不再需要这些中间 tensor
 
     # 3. 输出定点数与 scale
     scale = 1 / (2 ** 16)

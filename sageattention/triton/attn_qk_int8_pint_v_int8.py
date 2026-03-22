@@ -21,7 +21,7 @@ from .quant_pint import bf16_to_fixed_point, bf16_to_fixed_point_s8
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn, 
+                    K_ptrs, K_scale_ptr, V_ptrs, V_scale, stride_kn, stride_vn, 
                     start_m, mask_ptrs, stride_maskn,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
@@ -65,14 +65,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             acc = acc * alpha[:, None]
             
             v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
-            v_scale = tl.load(V_scale_ptr)
             
             p = p.to(tl.bfloat16)
             p_hi_s8, p_lo_s8 = bf16_to_fixed_point_s8(p)
             p_scale = 1.0 / (2 ** 16)
             
-            # acc += tl.dot(p_pint, v.to(tl.int32), out_dtype=tl.int32).to(tl.float32) * p_scale * v_scale
-            acc += (tl.dot(p_hi_s8, v)<<8 + tl.dot(p_lo_s8, v) + 32896 * tl.sum(v, 0)).to(tl.float32) * p_scale * v_scale
+            # acc += tl.dot(p_pint, v.to(tl.int32), out_dtype=tl.int32).to(tl.float32) * p_scale * V_scale
+            acc += ((tl.dot(p_hi_s8, v) << 8) + tl.dot(p_lo_s8, v) + 32896 * tl.sum(v, 0)).to(tl.float32) * p_scale * V_scale
 
             m_i = m_ij
         K_ptrs += BLOCK_N * stride_kn
@@ -102,8 +101,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, VM, Out, mask, Lse,
 
     q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
     k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
-    v_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)
-    vm_offset = (off_z * H + off_h) * HEAD_DIM
+    v_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * HEAD_DIM
+    vm_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * HEAD_DIM
     
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -113,7 +112,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, VM, Out, mask, Lse,
     K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None] 
     K_scale_ptr = K_scale + k_scale_offset
     V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
-    V_scale_ptr = V_scale + v_scale_offset
+    V_scale_ptr = V_scale + v_scale_offset + offs_k
     VM_ptr = VM + vm_offset + offs_k
     O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :]
     if mask is None:
@@ -127,14 +126,15 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, VM, Out, mask, Lse,
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn,
+    v_scale = tl.load(V_scale_ptr)
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, v_scale, stride_kn, stride_vn,
                                     start_m, mask_ptrs, stride_maskn,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n 
                                     )
     acc = acc / l_i[:, None]
     vm = tl.load(VM_ptr)
-    acc = acc + vm
+    acc = acc + vm[None, :]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
     if RETURN_LSE:

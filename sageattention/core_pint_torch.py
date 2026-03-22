@@ -14,7 +14,7 @@ def get_cuda_arch_versions():
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
 
-def sageattn_pint(
+def sageattn_pint_torch(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -75,12 +75,12 @@ def sageattn_pint(
         
     arch = get_cuda_arch_versions()[q.device.index]
     if True: # arch == "sm86":
-        return sageattn_qk_int8_p_pint_vint8_triton(q, k, v, tensor_layout=tensor_layout, sm_scale=sm_scale, return_lse=return_lse, smooth_k=True)
+        return sageattn_qk_int8_p_pint_vint8_torch(q, k, v, tensor_layout=tensor_layout, sm_scale=sm_scale, return_lse=return_lse, smooth_k=True)
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
 
-def sageattn_qk_int8_p_pint_vint8_triton(
+def sageattn_qk_int8_p_pint_vint8_torch(
     q: torch.Tensor, 
     k: torch.Tensor, 
     v: torch.Tensor, 
@@ -238,8 +238,81 @@ def sageattn_qk_int8_p_pint_vint8_triton(
         except Exception:
             raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
     
-    o, lse = attn_forward(q_int8, k_int8, v_int8, q_scale, k_scale, v_scale, vm, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
-    o = o[..., :head_dim_og]
+    # o, lse = attn_forward(q_int8, k_int8, v_int8, q_scale, k_scale, v_scale, vm, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
+    # import ipdb; ipdb.set_trace()
+    import torch.nn.functional as F
+    import torchmm
+    BLK_Q = 128
+    BLK_K = 64
+    def safe_block_matmul(q_int8, k_int8, q_scale, k_scale, BLK_Q, BLK_K):
+        if tensor_layout == "NHD":
+            q_int8 = q_int8.transpose(1, 2)
+            k_int8 = k_int8.transpose(1, 2)
+        # 1. 获取原始形状
+        B, H, Sq, Dq = q_int8.shape
+        B, H, Sk, Dk = k_int8.shape
+        
+        # 2. 计算需要填充的大小 (使其成为 BLK 的倍数)
+        pad_q = (BLK_Q - Sq % BLK_Q) % BLK_Q
+        pad_k = (BLK_K - Sk % BLK_K) % BLK_K
+        
+        # 3. 填充 q_int8 和 k_int8 (填充 0，因为 0 * scale = 0，不影响数值)
+        # padding 格式为 (left, right, top, bottom, ...)，这里只填充序列维度 (dim 2)
+        q_int8_padded = F.pad(q_int8, (0, 0, 0, pad_q), mode='constant', value=0)
+        k_int8_padded = F.pad(k_int8, (0, 0, 0, pad_k), mode='constant', value=0)
+        
+        # 4. 执行 Matmul (使用填充后的张量)
+        # 注意：这里使用 torch.matmul，如果是特定库的 torchmm 请替换回原函数
+        S_q = torchmm.matmul(q_int8_padded.to(torch.int32), 
+                        k_int8_padded.transpose(-2, -1).to(torch.int32))
+        
+        # 获取填充后的序列长度，用于后续的 view 操作
+        Sq_padded = q_int8_padded.shape[2]
+        Sk_padded = k_int8_padded.shape[2]
+        
+        # 5. 应用 Q 的 Scale (基于填充后的维度进行 view)
+        # view 形状：[B, H, NumBlocks_Q, BLK_Q, Sk_padded]
+        S_q = S_q.view(B, H, -1, BLK_Q, Sk_padded)
+        
+        # q_scale 通常为 [B, H, NumBlocks_Q, 1] 或 [B, H, NumBlocks_Q]
+        # 需要 broadcast 到 [B, H, NumBlocks_Q, 1, 1]
+        # 原代码有两个 unsqueeze，假设 q_scale 是 3 维 [B, H, Nb]，这里保持原逻辑
+        S_q = S_q * q_scale.unsqueeze(-1).unsqueeze(-1)
+        
+        # 6. 应用 K 的 Scale (基于填充后的维度进行 view)
+        # view 形状：[B, H, Sq_padded, NumBlocks_K, BLK_K]
+        S_q = S_q.view(B, H, Sq_padded, -1, BLK_K)
+        
+        # k_scale 需要 broadcast 到 [B, H, 1, NumBlocks_K, 1]
+        # 原代码 unsqueeze(-2).unsqueeze(-1)，保持原逻辑
+        S_q = S_q * k_scale.unsqueeze(-2).unsqueeze(-1)
+        
+        # 7. 还原形状并切片回原始长度
+        S_q = S_q.view(B, H, Sq_padded, Sk_padded)
+        
+        # 切片去除填充部分
+        S_q = S_q[:, :, :Sq, :Sk]
+        
+        return S_q
+
+    # --- 使用示例 ---
+    # S_q = safe_block_matmul(q_int8, k_int8, q_scale, k_scale, BLK_Q, BLK_K)
+    S_q = safe_block_matmul(q_int8, k_int8, q_scale, k_scale, BLK_Q, BLK_K)
+    S_q -= torch.max(S_q, dim=-1, keepdim=True)[0]
+    P_q = torch.softmax(S_q, dim=-1).to(torch.bfloat16)
+    from .triton.quant_pint import bf16_to_fixed_point_triton, bf16_to_fixed_point_torch
+    P_int32, P_scale = bf16_to_fixed_point_torch(P_q)
+    # import ipdb; ipdb.set_trace()
+    if tensor_layout == "NHD":
+        v_int8 = v_int8.transpose(1, 2)
+    O_q = torchmm.matmul(P_int32, v_int8.to(torch.int32)).to(torch.float32) * P_scale * v_scale[:,:,None,:]
+    o = O_q + vm[:,:,None,:]
+    if tensor_layout == "NHD":
+        o = o.transpose(1, 2)
+    
+    # o = P_q.to(torch.float16) @ v.to(torch.float16)
+    
+    o = o[..., :head_dim_og].to(dtype)
     # print(f"v_int8({v_int8.shape}): {v_int8}")
     # print(f"v_scale({v_scale.shape}): {v_scale}")
     # print(f"vm({vm.shape}): {vm}")

@@ -141,6 +141,7 @@ def sageattn(
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
+    return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, smooth_k=True)
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
@@ -335,8 +336,8 @@ def sageattn_qk_int8_pv_fp16_triton(
     # ender.record()
     # torch.cuda.synchronize()
     # print(f"attn, is_causal: {is_causal}, time: {starter.elapsed_time(ender)} ms")
-    
     o = o[..., :head_dim_og]
+    torch.save({"o":o}, "sage_o_int8.pt")
 
     if return_lse:
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
