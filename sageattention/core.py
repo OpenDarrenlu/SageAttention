@@ -337,7 +337,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     # torch.cuda.synchronize()
     # print(f"attn, is_causal: {is_causal}, time: {starter.elapsed_time(ender)} ms")
     o = o[..., :head_dim_og]
-    torch.save({"o":o}, "sage_o_int8.pt")
+    # torch.save({"o":o}, "sage_o_int8.pt")
 
     if return_lse:
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
