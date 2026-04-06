@@ -146,22 +146,22 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-        # save q, k, v for every layer
-        import os
-        pts_in_pwd = [f for f in os.listdir() if f.endswith(".pt")]
-        if len(pts_in_pwd) == 0:
-            max_id = -1
-        else:
-            max_id = max([int(f.split(".")[0].split("_")[-1]) for f in pts_in_pwd])
-        now_pt_path = f"qkvp_tensors_{max_id + 1}.pt"
-        if (not os.path.exists(now_pt_path)):
-            torch.save({
-                'query': q,
-                'key': k,
-                'value': v,
-            }, now_pt_path)
-        else:
-            print(f"qkvp_tensors_{max_id + 1}.pt already exists, skip saving")
+        # # save q, k, v for every layer
+        # import os
+        # pts_in_pwd = [f for f in os.listdir() if f.endswith(".pt")]
+        # if len(pts_in_pwd) == 0:
+        #     max_id = -1
+        # else:
+        #     max_id = max([int(f.split(".")[0].split("_")[-1]) for f in pts_in_pwd])
+        # now_pt_path = f"qkvp_tensors_{max_id + 1}.pt"
+        # if (not os.path.exists(now_pt_path)):
+        #     torch.save({
+        #         'query': q,
+        #         'key': k,
+        #         'value': v,
+        #     }, now_pt_path)
+        # else:
+        #     print(f"qkvp_tensors_{max_id + 1}.pt already exists, skip saving")
         x = self.attn_func(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),

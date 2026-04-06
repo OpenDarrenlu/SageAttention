@@ -39,7 +39,8 @@ class WanT2V:
         use_usp=False,
         t5_cpu=False,
         use_delSubnorm=False,
-        use_pint=True
+        use_pint=False,
+        use_p_codebook=False
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -139,6 +140,57 @@ class WanT2V:
                 return output
             for block in self.model.blocks:
                 block.self_attn.attn_func = normal_attn
+                self.sp_size = 1
+        elif use_p_codebook:
+            # 使用 P codebook 量化的 Attention
+            # 预训练的 centroids（从 results.txt 中获取）
+            p_codebook_centroids = torch.tensor([
+                0.0000, 0.0609, 0.1123, 0.1715, 0.2381, 0.3104, 0.3859, 0.4637,
+                0.5436, 0.6242, 0.7028, 0.7780, 0.8483, 0.9104, 0.9616, 0.9961
+            ], dtype=torch.float32)
+            
+            def quantize_p(p: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+                """量化 P 到最近的质心索引"""
+                c = centroids.to(device=p.device, dtype=p.dtype)
+                dist = (p.unsqueeze(-1) - c).abs()
+                return dist.argmin(dim=-1)
+            
+            def dequantize_p(indices: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+                """从索引反量化回 P"""
+                return centroids.to(device=indices.device, dtype=torch.float32)[indices.long()]
+            
+            def p_codebook_attn(q, k, v, k_lens=None, window_size=None):
+                """
+                使用 P codebook 量化的 multi-head attention.
+                Input shape: [batch, seq_len, num_heads, head_dim]
+                """
+                # Reorder to [batch, num_heads, seq_len, head_dim] for efficient matmul
+                q = q.transpose(1, 2)  # [b, n, s, d]
+                k = k.transpose(1, 2)  # [b, n, s, d]
+                v = v.transpose(1, 2)  # [b, n, s, d]
+
+                # Scaled dot-product attention
+                attn_weights = torch.matmul(q, k.transpose(-2, -1))  # [b, n, s, s]
+                
+                # scale by sqrt(d)
+                attn_weights = attn_weights / (q.size(-1) ** 0.5)
+
+                # Apply softmax -> outputs sum to 1, values in (0, 1)
+                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                
+                # 使用 P codebook 量化
+                indices = quantize_p(attn_weights, p_codebook_centroids)
+                attn_weights_quant = dequantize_p(indices, p_codebook_centroids)
+
+                # Compute output with quantized P
+                output = torch.matmul(attn_weights_quant, v)  # [b, n, s, d]
+                
+                # Restore original shape: [b, s, n, d]
+                output = output.transpose(1, 2).contiguous()
+                return output
+            
+            for block in self.model.blocks:
+                block.self_attn.attn_func = p_codebook_attn
                 self.sp_size = 1
         elif use_pint:
             def pint_attn(q, k, v, k_lens=None, window_size=None):

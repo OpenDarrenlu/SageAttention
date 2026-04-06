@@ -199,11 +199,88 @@ class Pcodebook:
         importance_exp: float = 1.0,
         layer_idx: Optional[int] = None,
         max_iter: int = 200,
+        include_zero: bool = False,
+        zero_threshold: float = 0.01,
     ) -> "Pcodebook":
         n_levels = 2 ** bits
-        w = _p_importance_weights(p, importance_exp)
-        c = _weighted_lloyd_1d(p, w, n_levels, max_iter=max_iter)
+        
+        if include_zero:
+            # 如果包含 0，我们需要调整拟合过程
+            # 1. 先拟合 n_levels - 1 个质心（不包含 0）
+            # 2. 然后将 0 添加进去
+            # 或者：先拟合 n_levels 个质心，然后替换最小的为 0
+            
+            # 方法：先正常拟合，然后增强
+            w = _p_importance_weights(p, importance_exp)
+            c = _weighted_lloyd_1d(p, w, n_levels, max_iter=max_iter)
+            
+            # 增强：将小于 zero_threshold 的质心替换为 0，保持数量不变
+            c = cls._enhance_centroids_with_zero(c, zero_threshold=zero_threshold)
+        else:
+            # 正常拟合
+            w = _p_importance_weights(p, importance_exp)
+            c = _weighted_lloyd_1d(p, w, n_levels, max_iter=max_iter)
+        
         return cls(bits=bits, centroids=c.cpu(), importance_exp=importance_exp, layer_idx=layer_idx)
+    
+    @staticmethod
+    def _enhance_centroids_with_zero(centroids: torch.Tensor, zero_threshold: float = 0.01) -> torch.Tensor:
+        """
+        将质心中小于 zero_threshold 的替换为 0，保持升序和数量不变
+        
+        Args:
+            centroids: 原始质心（升序）
+            zero_threshold: 小于此值的质心被替换为 0
+        
+        Returns:
+            增强后的质心
+        """
+        c = centroids.clone()
+        n = len(c)
+        # import ipdb; ipdb.set_trace()
+        # 找到第一个大于等于 zero_threshold 的位置
+        idx = (c >= zero_threshold).nonzero(as_tuple=True)[0]
+        if len(idx) == 0:
+            # 所有质心都小于 threshold，将第一个设为 0，其余保持
+            c[0] = 0.0
+        else:
+            first_keep_idx = idx[0].item()
+            if first_keep_idx > 0:
+                # 有小于 threshold 的质心
+                # 将第一个设为 0，然后保留从 first_keep_idx 开始的质心
+                # 如果数量不够，需要插值
+                keep = c[first_keep_idx:]
+                m = len(keep)
+                if m < n - 1:
+                    # 需要插值补充
+                    x_old = torch.linspace(0, 1, m)
+                    x_new = torch.linspace(0, 1, n - 1)
+                    # 使用 numpy 插值
+                    import numpy as np
+                    keep_np = keep.cpu().numpy()
+                    x_old_np = x_old.cpu().numpy()
+                    x_new_np = x_new.cpu().numpy()
+                    keep_interp = torch.tensor(
+                        np.interp(x_new_np, x_old_np, keep_np),
+                        device=centroids.device,
+                        dtype=centroids.dtype
+                    )
+                    keep = keep_interp
+                # 拼接 0 和 keep
+                c = torch.cat([torch.tensor([0.0], device=centroids.device, dtype=centroids.dtype), keep])
+                # 确保数量正确
+                if len(c) > n:
+                    c = c[:n]
+                elif len(c) < n:
+                    # 重复最后一个元素
+                    pad = c[-1:].repeat(n - len(c))
+                    c = torch.cat([c, pad])
+            else:
+                c[0] = 0.0
+        
+        # 确保升序
+        c, _ = torch.sort(c)
+        return c
 
     def quantize(self, p: torch.Tensor) -> torch.Tensor:
         """最近质心索引，与 centroids 同 device 计算。"""
@@ -229,6 +306,8 @@ def fit_p_codebook_from_pt_files(
     max_samples: int = 2_000_000,
     layer_idx: Optional[int] = None,
     check_stability: bool = True,
+    include_zero: bool = False,
+    zero_threshold: float = 0.01,
 ) -> Tuple[Pcodebook, Optional[StabilityReport]]:
     """
     从多个 .pt 汇总 P 样本，拟合一个 Pcodebook。
@@ -251,7 +330,12 @@ def fit_p_codebook_from_pt_files(
         cat = cat[idx]
 
     book = Pcodebook.fit_from_p_samples(
-        cat, bits=bits, importance_exp=importance_exp, layer_idx=layer_idx
+        cat, 
+        bits=bits, 
+        importance_exp=importance_exp, 
+        layer_idx=layer_idx,
+        include_zero=include_zero,
+        zero_threshold=zero_threshold,
     )
     return book, report
 
@@ -289,7 +373,13 @@ class PcodebookManager:
         self._buffers[layer_idx] = merged
         self._buffer_sizes[layer_idx] = merged.numel()
 
-    def finalize_layer(self, layer_idx: int, max_iter: int = 200) -> Pcodebook:
+    def finalize_layer(
+        self, 
+        layer_idx: int, 
+        max_iter: int = 200,
+        include_zero: bool = False,
+        zero_threshold: float = 0.01,
+    ) -> Pcodebook:
         """用当前缓冲区样本 fit 该层 codebook。"""
         buf = self._buffers.get(layer_idx)
         if buf is None or buf.numel() == 0:
@@ -300,14 +390,26 @@ class PcodebookManager:
             importance_exp=self.importance_exp,
             layer_idx=layer_idx,
             max_iter=max_iter,
+            include_zero=include_zero,
+            zero_threshold=zero_threshold,
         )
         self.codebooks[layer_idx] = book
         return book
 
-    def finalize_all(self, max_iter: int = 200) -> Dict[int, Pcodebook]:
+    def finalize_all(
+        self, 
+        max_iter: int = 200,
+        include_zero: bool = False,
+        zero_threshold: float = 0.01,
+    ) -> Dict[int, Pcodebook]:
         for lid in list(self._buffers.keys()):
             if self._buffer_sizes.get(lid, 0) > 0:
-                self.finalize_layer(lid, max_iter=max_iter)
+                self.finalize_layer(
+                    lid, 
+                    max_iter=max_iter,
+                    include_zero=include_zero,
+                    zero_threshold=zero_threshold,
+                )
         return dict(self.codebooks)
 
     def clear_buffers(self) -> None:
@@ -429,7 +531,7 @@ def attention_forward_p_quant_only(
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
     p = F.softmax(scores, dim=-1)
     pq = book.quantize_dequantize(p)
-    out = torch.matmul(pq, v)
+    out = torch.matmul(pq, v.to(pq.dtype))
     return out, p
 
 

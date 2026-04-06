@@ -162,6 +162,11 @@ def _parse_args():
         default=False,
         help="Whether to use pint attention.")
     parser.add_argument(
+        "--use_p_codebook",
+        action="store_true",
+        default=False,
+        help="Whether to use p codebook attention.")
+    parser.add_argument(
         "--dit_fsdp",
         action="store_true",
         default=False,
@@ -379,6 +384,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             use_delSubnorm=args.use_delSubnorm,
             use_pint=args.use_pint,
+            use_p_codebook=args.use_p_codebook,
         )
 
         logging.info(
