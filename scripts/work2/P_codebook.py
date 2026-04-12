@@ -134,6 +134,8 @@ class StabilityReport:
     stable: bool
     cv_mean_p: float
     cv_std_p: float
+    mean_per_token_similarity: float
+    min_per_token_similarity: float
     per_source_mean: List[float]
     message: str
 
@@ -142,9 +144,10 @@ def evaluate_p_distribution_stability(
     p_tensors: List[torch.Tensor],
     mean_cv_threshold: float = 0.35,
     std_cv_threshold: float = 0.50,
+    per_token_similarity_threshold: float = 0.90,
 ) -> StabilityReport:
     """
-    用多份 P 的逐张量 mean/std 的变异系数判断分布是否“稳定”。
+    用多份 P 的逐张量 mean/std 的变异系数以及 per-token 相似性判断分布是否“稳定”。
     若不稳定，使用固定 codebook 风险较大，应报警。
     """
     means = [t.float().mean().item() for t in p_tensors]
@@ -153,10 +156,31 @@ def evaluate_p_distribution_stability(
     s_bar = sum(stds) / max(len(stds), 1)
     cv_m = (torch.tensor(means).std().item() / (abs(m_bar) + 1e-12)) if len(means) > 1 else 0.0
     cv_s = (torch.tensor(stds).std().item() / (abs(s_bar) + 1e-12)) if len(stds) > 1 else 0.0
-    stable = (cv_m <= mean_cv_threshold) and (cv_s <= std_cv_threshold)
+    
+    # 计算 per-token 相似性
+    mean_per_token_sim = 0.0
+    min_per_token_sim = 1.0
+    if len(p_tensors) >= 2:
+        similarities = []
+        for i in range(len(p_tensors)):
+            for j in range(i + 1, len(p_tensors)):
+                # 确保两个张量形状相同
+                t1 = p_tensors[i].float().reshape(-1)
+                t2 = p_tensors[j].float().reshape(-1)
+                # 计算余弦相似度
+                sim = F.cosine_similarity(t1.unsqueeze(0), t2.unsqueeze(0), dim=1).item()
+                similarities.append(sim)
+        if similarities:
+            mean_per_token_sim = sum(similarities) / len(similarities)
+            min_per_token_sim = min(similarities)
+    
+    # 判断稳定性：同时满足 CV 阈值和 per-token 相似性阈值
+    stable = (cv_m <= mean_cv_threshold) and (cv_s <= std_cv_threshold) and (mean_per_token_sim >= per_token_similarity_threshold)
     msg = (
         f"P 分布稳定性: {'通过' if stable else '不通过'} "
-        f"(mean CV={cv_m:.4f}, std CV={cv_s:.4f}; 阈值 mean<={mean_cv_threshold}, std<={std_cv_threshold})"
+        f"(mean CV={cv_m:.4f}, std CV={cv_s:.4f}, mean per-token sim={mean_per_token_sim:.4f}, "
+        f"min per-token sim={min_per_token_sim:.4f}; 阈值 mean<={mean_cv_threshold}, std<={std_cv_threshold}, "
+        f"per-token sim>={per_token_similarity_threshold})"
     )
     if not stable:
         warnings.warn(msg, UserWarning)
@@ -164,6 +188,8 @@ def evaluate_p_distribution_stability(
         stable=stable,
         cv_mean_p=cv_m,
         cv_std_p=cv_s,
+        mean_per_token_similarity=mean_per_token_sim,
+        min_per_token_similarity=min_per_token_sim,
         per_source_mean=means,
         message=msg,
     )

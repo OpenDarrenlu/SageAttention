@@ -8,6 +8,7 @@
 3. 拟合 codebook
 4. 验证 PV 准确率
 5. 保存结果
+6. （可选）画出 P 映射到每个质点的分布直方图
 """
 
 import argparse
@@ -19,6 +20,17 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+
+# 尝试导入 matplotlib，如果失败则跳过绘图功能
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')  # 使用非交互式后端
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("⚠  matplotlib 未安装，将跳过绘图功能")
 
 # 导入 P_codebook 模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -152,14 +164,13 @@ def verify_attention_accuracy(
     Returns:
         精度指标字典
     """
-    # import ipdb; ipdb.set_trace()
     # 原始 Attention
     d = q.size(-1)
     if scale is None:
         scale = 1.0 / math.sqrt(float(d))
     scores_orig = torch.matmul(q, k.transpose(-2, -1)) * scale
     p_orig = F.softmax(scores_orig, dim=-1)
-    out_orig = torch.matmul(p_orig, v.to(p_orig.dtype))
+    out_orig = torch.matmul(p_orig, v)
     
     # 量化后的 Attention
     out_quant, p_exact = attention_forward_p_quant_only(q, k, v, book, scale=scale)
@@ -180,6 +191,138 @@ def verify_attention_accuracy(
     }
 
 
+def plot_p_distribution_histogram(
+    p_tensors: List[torch.Tensor],
+    codebook: Pcodebook,
+    output_dir: str,
+    num_bins: int = 100,
+    max_samples: int = 1_000_000,
+) -> None:
+    """
+    画出 P 映射到每个质点的分布直方图
+    
+    Args:
+        p_tensors: P tensor 列表
+        codebook: Pcodebook
+        output_dir: 输出目录
+        num_bins: 直方图的 bin 数量
+        max_samples: 最大采样数
+    """
+    if not HAS_MATPLOTLIB:
+        print("⚠  matplotlib 未安装，跳过绘图")
+        return
+    
+    print(f"\n[绘图] 生成 P 分布直方图...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 1. 收集所有 P 值
+    all_p_values = []
+    for p in p_tensors:
+        flat_p = p.flatten().cpu().numpy()
+        all_p_values.append(flat_p)
+    
+    all_p_values = np.concatenate(all_p_values)
+    
+    # 采样减少数据量
+    if len(all_p_values) > max_samples:
+        idx = np.random.choice(len(all_p_values), max_samples, replace=False)
+        all_p_values = all_p_values[idx]
+    
+    # 2. 计算每个 P 值对应的质心索引
+    centroids = codebook.centroids.cpu().numpy()
+    
+    # 使用快速搜索找到最近质心（因为 centroids 已排序）
+    indices = np.searchsorted(centroids, all_p_values)
+    indices = np.clip(indices, 1, len(centroids) - 1)
+    
+    # 比较左右两边，选择更近的
+    left_dist = np.abs(all_p_values - centroids[indices - 1])
+    right_dist = np.abs(all_p_values - centroids[indices])
+    final_indices = np.where(left_dist < right_dist, indices - 1, indices)
+    
+    # 3. 画出两个图：
+    
+    # 图 1: P 的原始分布直方图 + 质心位置
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # 子图 1: P 的原始分布
+    ax1 = axes[0]
+    n, bins, patches = ax1.hist(all_p_values, bins=num_bins, alpha=0.7, color='skyblue', edgecolor='black')
+    ax1.set_xlabel('P value', fontsize=12)
+    ax1.set_ylabel('Count', fontsize=12)
+    ax1.set_title('Distribution of Attention P Values', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    # 在质心位置画垂直线
+    for i, centroid in enumerate(centroids):
+        ax1.axvline(x=centroid, color='red', linestyle='--', linewidth=1.5, alpha=0.8)
+        ax1.text(centroid, ax1.get_ylim()[1] * 0.95, f'{i}', 
+                ha='center', va='top', fontsize=9, color='red', fontweight='bold')
+    
+    # 子图 2: 每个质心的计数
+    ax2 = axes[1]
+    centroid_counts = np.bincount(final_indices, minlength=len(centroids))
+    centroid_labels = [f'{i}: {c:.4f}' for i, c in enumerate(centroids)]
+    
+    bars = ax2.bar(range(len(centroids)), centroid_counts, color='lightcoral', edgecolor='black', alpha=0.7)
+    ax2.set_xlabel('Centroid Index', fontsize=12)
+    ax2.set_ylabel('Count', fontsize=12)
+    ax2.set_title('Distribution of P Values Mapped to Each Centroid', fontsize=14, fontweight='bold')
+    ax2.set_xticks(range(len(centroids)))
+    ax2.set_xticklabels([str(i) for i in range(len(centroids))], rotation=0)
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # 在柱子上添加数值
+    for i, (bar, count) in enumerate(zip(bars, centroid_counts)):
+        height = bar.get_height()
+        if count > 0:
+            ax2.text(bar.get_x() + bar.get_width()/2., height * 1.02,
+                    f'{count}', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    histogram_path = os.path.join(output_dir, 'p_distribution_histogram.png')
+    plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
+    print(f"  ✓ 直方图保存到: {histogram_path}")
+    
+    # 也保存一个对数刻度的版本
+    fig2, ax3 = plt.subplots(1, 1, figsize=(12, 5))
+    bars_log = ax3.bar(range(len(centroids)), centroid_counts, color='lightcoral', edgecolor='black', alpha=0.7)
+    ax3.set_yscale('log')
+    ax3.set_xlabel('Centroid Index', fontsize=12)
+    ax3.set_ylabel('Count (log scale)', fontsize=12)
+    ax3.set_title('Distribution (Log Scale)', fontsize=14, fontweight='bold')
+    ax3.set_xticks(range(len(centroids)))
+    ax3.set_xticklabels([str(i) for i in range(len(centroids))])
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    histogram_log_path = os.path.join(output_dir, 'p_distribution_histogram_log.png')
+    plt.savefig(histogram_log_path, dpi=150, bbox_inches='tight')
+    print(f"  ✓ 对数刻度直方图保存到: {histogram_log_path}")
+    
+    plt.close('all')
+    
+    # 保存统计信息到文本
+    stats_path = os.path.join(output_dir, 'p_distribution_stats.txt')
+    with open(stats_path, 'w') as f:
+        f.write("=== P 分布统计信息 ===\n\n")
+        f.write(f"总样本数: {len(all_p_values)}\n")
+        f.write(f"P 范围: [{all_p_values.min():.6f}, {all_p_values.max():.6f}]\n")
+        f.write(f"P 均值: {all_p_values.mean():.6f}\n")
+        f.write(f"P 标准差: {all_p_values.std():.6f}\n\n")
+        
+        f.write("质心分布:\n")
+        f.write(f"{'Index':<8} {'Centroid':<12} {'Count':<12} {'Percentage':<12}\n")
+        f.write(f"{'-'*48}\n")
+        total_count = centroid_counts.sum()
+        for i, (c, count) in enumerate(zip(centroids, centroid_counts)):
+            percentage = (count / total_count * 100) if total_count > 0 else 0
+            f.write(f"{i:<8} {c:<12.6f} {count:<12} {percentage:<12.2f}%\n")
+    
+    print(f"  ✓ 统计信息保存到: {stats_path}")
+
+
 def run_importance_exp_scan(
     pt_files: List[str],
     bits: int = 4,
@@ -198,6 +341,8 @@ def run_importance_exp_scan(
         importance_exp_list: 要扫描的 importance_exp 列表
         max_samples: 最大样本数
         device: 设备
+        include_zero: 是否在码表中包含 0
+        zero_threshold: 小于此值的 P 量化为 0
     
     Returns:
         每个 importance_exp 对应的结果字典
@@ -231,7 +376,7 @@ def run_importance_exp_scan(
     for exp in importance_exp_list:
         print(f"\n[扫描] importance_exp = {exp}")
         try:
-            # 拟合 codebook
+            # 拟合 codebook（直接使用 include_zero 参数）
             codebook, _ = fit_p_codebook_from_pt_files(
                 pt_files,
                 bits=bits,
@@ -324,6 +469,8 @@ def run_pt_folder_demo(
     importance_exp_list: Optional[List[float]] = None,
     include_zero: bool = False,
     zero_threshold: float = 0.01,
+    plot_histogram: bool = False,
+    histogram_max_samples: int = 1_000_000,
 ) -> Dict[str, Any]:
     results = {}
     
@@ -331,8 +478,17 @@ def run_pt_folder_demo(
     print(f"[配置] device={dev}, bits={bits}, importance_exp={importance_exp}, "
           f"max_samples={max_samples}")
     
+    # 计算总步数
+    total_steps = 6  # 基础步数
+    if verify_attention:
+        total_steps += 1
+    if plot_histogram:
+        total_steps += 1
+    if scan_importance_exp:
+        total_steps += 1
+    
     # 1. 查找 .pt 文件
-    print(f"\n[1/6] 查找 .pt 文件 (文件夹: {pt_folder})")
+    print(f"\n[1/{total_steps}] 查找 .pt 文件 (文件夹: {pt_folder})")
     pt_files = find_pt_files(pt_folder, recursive=recursive)
     if not pt_files:
         raise ValueError(f"在文件夹 {pt_folder} 中未找到 .pt 文件")
@@ -342,7 +498,7 @@ def run_pt_folder_demo(
     results["pt_files"] = pt_files
     
     # 2. 加载 P tensor
-    print(f"\n[2/6] 加载 P tensor")
+    print(f"\n[2/{total_steps}] 加载 P tensor")
     p_tensors = load_all_p_tensors(pt_files, device=dev)
     if not p_tensors:
         raise ValueError("未能加载任何有效 P tensor")
@@ -350,7 +506,7 @@ def run_pt_folder_demo(
     
     # 3. 检查分布稳定性
     if check_stability and len(p_tensors) >= 2:
-        print(f"\n[3/6] 评估 P 分布稳定性")
+        print(f"\n[3/{total_steps}] 评估 P 分布稳定性")
         stability_report = evaluate_p_distribution_stability(p_tensors)
         print(f"  {stability_report.message}")
         results["stability"] = {
@@ -360,11 +516,11 @@ def run_pt_folder_demo(
             "per_source_mean": stability_report.per_source_mean,
         }
     else:
-        print(f"\n[3/6] 跳过分布稳定性检查 (少于 2 个文件或 check_stability=False)")
+        print(f"\n[3/{total_steps}] 跳过分布稳定性检查 (少于 2 个文件或 check_stability=False)")
         results["stability"] = None
     
     # 4. 拟合 codebook
-    print(f"\n[4/6] 拟合 P codebook")
+    print(f"\n[4/{total_steps}] 拟合 P codebook")
     if include_zero:
         print(f"  [配置] 包含 0 (zero_threshold={zero_threshold})")
     codebook, rep = fit_p_codebook_from_pt_files(
@@ -386,8 +542,8 @@ def run_pt_folder_demo(
     }
     
     # 5. 验证 PV 准确率
-    total_steps = 8 if verify_attention else 6
-    print(f"\n[5/{total_steps}] 验证 PV 准确率")
+    current_step = 5
+    print(f"\n[{current_step}/{total_steps}] 验证 PV 准确率")
     v_tensors = []
     pv_metrics_list = []
     
@@ -417,7 +573,8 @@ def run_pt_folder_demo(
     # 6. 验证端到端 Attention 精度
     attn_metrics_list = []
     if verify_attention:
-        print(f"\n[6/{total_steps}] 验证端到端 Attention 精度")
+        current_step += 1
+        print(f"\n[{current_step}/{total_steps}] 验证端到端 Attention 精度")
         
         for i, path in enumerate(pt_files):
             q, k, v = load_qkv_from_pt(path, device=dev)
@@ -446,9 +603,20 @@ def run_pt_folder_demo(
                 "average": avg_attn_metrics,
             }
     
-    # 7. Importance Exp 扫描（如果启用）
+    # 7. 画出 P 分布直方图（如果启用）
+    if plot_histogram and output_dir:
+        current_step += 1
+        plot_p_distribution_histogram(
+            p_tensors,
+            codebook,
+            output_dir,
+            max_samples=histogram_max_samples,
+        )
+    
+    # 8. Importance Exp 扫描（如果启用）
     if scan_importance_exp:
-        print(f"\n[7/{total_steps}] 执行 Importance Exp 扫描")
+        current_step += 1
+        print(f"\n[{current_step}/{total_steps}] 执行 Importance Exp 扫描")
         scan_results = run_importance_exp_scan(
             pt_files,
             bits=bits,
@@ -460,10 +628,10 @@ def run_pt_folder_demo(
         )
         results["importance_exp_scan"] = scan_results
     
-    # 8. 保存结果
-    total_steps = 8 if verify_attention else 6
+    # 9. 保存结果
     if output_dir:
-        print(f"\n[{total_steps}/{total_steps}] 保存结果到: {output_dir}")
+        current_step += 1
+        print(f"\n[{current_step}/{total_steps}] 保存结果到: {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
         
         # 保存 codebook
@@ -524,7 +692,7 @@ def run_pt_folder_demo(
         results["output_dir"] = output_dir
         results["saved_files"] = [codebook_path, manager_path, result_txt_path]
     else:
-        print(f"\n[{total_steps}/{total_steps}] 跳过保存结果 (output_dir 未指定)")
+        print(f"\n[{current_step}/{total_steps}] 跳过保存结果 (output_dir 未指定)")
     
     print(f"\n[完成] 所有步骤执行完毕！")
     return results
@@ -593,7 +761,7 @@ def main():
         "--importance-exp-list",
         type=float,
         nargs="+",
-        default=[-0.1, -0.2, -0.5, -1.0, -1.5, -2.0, -3.0],
+        default=[0.2, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0],
         help="要扫描的 importance_exp 值列表 (默认: 0.2 0.5 0.8 1.0 1.5 2.0 3.0)"
     )
     parser.add_argument(
@@ -606,6 +774,17 @@ def main():
         type=float,
         default=0.01,
         help="小于此值的 P 量化为 0 (默认: 0.01)"
+    )
+    parser.add_argument(
+        "--plot-histogram",
+        action="store_true",
+        help="画出 P 映射到每个质点的分布直方图 (需要 matplotlib)"
+    )
+    parser.add_argument(
+        "--histogram-max-samples",
+        type=int,
+        default=1_000_000,
+        help="直方图的最大采样数 (默认: 1,000,000)"
     )
     
     args = parser.parse_args()
@@ -625,6 +804,8 @@ def main():
             importance_exp_list=args.importance_exp_list,
             include_zero=args.include_zero,
             zero_threshold=args.zero_threshold,
+            plot_histogram=args.plot_histogram,
+            histogram_max_samples=args.histogram_max_samples,
         )
     except Exception as e:
         print(f"\n错误: {e}")
