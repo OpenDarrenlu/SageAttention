@@ -39,7 +39,7 @@ class WanT2V:
         use_usp=False,
         t5_cpu=False,
         use_delSubnorm=False,
-        use_pint=False,
+        use_lut=False,
         use_p_codebook=False
     ):
         r"""
@@ -192,12 +192,12 @@ class WanT2V:
             for block in self.model.blocks:
                 block.self_attn.attn_func = p_codebook_attn
                 self.sp_size = 1
-        elif use_pint:
-            def pint_attn(q, k, v, k_lens=None, window_size=None):
-                from sageattention import sageattn, sageattn_pint, sageattn_pint_torch
-                return sageattn_pint_torch(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD").to(q.dtype)
+        elif use_lut:
+            def lut_attn(q, k, v, k_lens=None, window_size=None):
+                from sageattention import sageattn_lut
+                return sageattn_lut(q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), tensor_layout="NHD").to(q.dtype)
             for block in self.model.blocks:
-                block.self_attn.attn_func = pint_attn
+                block.self_attn.attn_func = lut_attn
                 self.sp_size = 1
         else:
             self.sp_size = 1

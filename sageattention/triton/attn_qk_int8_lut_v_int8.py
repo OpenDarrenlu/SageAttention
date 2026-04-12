@@ -137,7 +137,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, V_scale, VM, Out, mask, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, v_scale, vm, tensor_layout="HND", attn_mask=None, output_dtype=torch.bfloat16, return_lse=False):
+def forward(q, k, v, q_scale, k_scale, v_scale, vm, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1

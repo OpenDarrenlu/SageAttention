@@ -157,10 +157,10 @@ def _parse_args():
         help="Whether to use delSubnorm attention.")
     
     parser.add_argument(
-        "--use_pint",
+        "--use_lut",
         action="store_true",
         default=False,
-        help="Whether to use pint attention.")
+        help="Whether to use lut attention.")
     parser.add_argument(
         "--use_p_codebook",
         action="store_true",
@@ -383,7 +383,7 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
             use_delSubnorm=args.use_delSubnorm,
-            use_pint=args.use_pint,
+            use_lut=args.use_lut,
             use_p_codebook=args.use_p_codebook,
         )
 
