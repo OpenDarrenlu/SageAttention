@@ -23,6 +23,45 @@ using `bench/bench_qk_int4_pv_fp8_cuda.py --num_warmups 10 --num_tests 30 --int4
 | 4096            | 3.755             | 3.258             | 1.153x  | 0.00427       | 0.15173      | cfg0             |
 | 8192            | 12.112            | 10.179            | 1.190x  | 0.00303       | 0.06354      | cfg0             |
 
+### RTX 4090 Smooth-Q Accuracy Comparison
+
+The current production INT4 branch only smooths `K`. To study whether smoothing `Q`
+would help accuracy, this fork also includes an **accuracy-only smooth-Q emulation benchmark**
+in `bench/bench_qk_int4_pv_fp8_cuda_smooth_q.py`.
+
+- Baseline: `sageattn_qk_int8_pv_fp8_cuda(...)`
+- Current INT4 path: `sageattn_qk_int4_pv_fp8_cuda(...)` (no Q smoothing)
+- Smooth-Q path: block-mean smooth-Q emulation with `deltaS` correction, used for accuracy comparison only
+
+Measured on an NVIDIA GeForce RTX 4090 with:
+`batch=4`, `num_heads=32`, `head_dim=128`, `dtype=fp16`, using seeds `0,1,2`.
+The tables below report output differences relative to the INT8 baseline.
+
+Run command:
+
+```bash
+python bench/bench_qk_int4_pv_fp8_cuda_smooth_q.py \
+  --cases 'fp16,0,4,32,1024,128;fp16,0,4,32,2048,128;fp16,0,4,32,4096,128;fp16,1,4,32,1024,128;fp16,1,4,32,2048,128' \
+  --seeds 0,1,2
+```
+
+#### Non-causal attention
+
+| Sequence Length | Current INT4 Mean Abs Diff | Current INT4 Max Abs Diff | Smooth-Q Mean Abs Diff | Smooth-Q Max Abs Diff | Delta Mean |
+|-----------------|---------------------------:|--------------------------:|-----------------------:|----------------------:|-----------:|
+| 1024            | 0.008405                   | 0.203369                  | 0.008386               | 0.243530              | -0.000020  |
+| 2048            | 0.006003                   | 0.141602                  | 0.005986               | 0.142578              | -0.000017  |
+| 4096            | 0.004267                   | 0.087341                  | 0.004255               | 0.165039              | -0.000012  |
+
+#### Causal attention
+
+| Sequence Length | Current INT4 Mean Abs Diff | Current INT4 Max Abs Diff | Smooth-Q Mean Abs Diff | Smooth-Q Max Abs Diff | Delta Mean |
+|-----------------|---------------------------:|--------------------------:|-----------------------:|----------------------:|-----------:|
+| 1024            | 0.014625                   | 0.947266                  | 0.014615               | 0.886230              | -0.000009  |
+| 2048            | 0.010808                   | 0.881836                  | 0.010799               | 1.027344              | -0.000008  |
+
+In short, the smooth-Q emulation consistently improves `Mean Abs Diff` by a very small margin on RTX 4090, but `Max Abs Diff` is mixed: some settings improve, while others become worse. Based on these results, smooth-Q looks like a mild average-case accuracy improvement rather than a uniformly better replacement for the current no-smooth-Q INT4 path.
+
 ## Experimental SM89 LUT Softmax
 
 This fork also includes an experimental Ada-only INT8 path that replaces the per-logit softmax `exp` with a direct E4M3 LUT inside the fused attention kernel:
