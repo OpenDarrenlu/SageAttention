@@ -40,7 +40,11 @@ class WanT2V:
         t5_cpu=False,
         use_delSubnorm=False,
         use_lut=False,
-        use_p_codebook=False
+        use_p_codebook=False,
+        p_quant_dtype="fp16",
+        v_quant_dtype="int8",
+        p_block_n=64,
+        v_block_size=0,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -195,7 +199,14 @@ class WanT2V:
         elif use_lut:
             def lut_attn(q, k, v, k_lens=None, window_size=None):
                 from sageattention import sageattn_lut
-                return sageattn_lut(q.to(torch.float16), k.to(torch.float16), v.to(torch.float16), tensor_layout="NHD").to(q.dtype)
+                return sageattn_lut(
+                    q.to(torch.float16), k.to(torch.float16), v.to(torch.float16),
+                    tensor_layout="NHD",
+                    p_quant_dtype=p_quant_dtype,
+                    v_quant_dtype=v_quant_dtype,
+                    p_block_n=p_block_n,
+                    v_block_size=v_block_size,
+                ).to(q.dtype)
             for block in self.model.blocks:
                 block.self_attn.attn_func = lut_attn
                 self.sp_size = 1

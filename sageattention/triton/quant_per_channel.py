@@ -265,6 +265,168 @@ def _per_channel_int8_triton(v: torch.Tensor, scale_max: float, smooth_v: bool):
     return v_quant, scale, mean if smooth_v else None
 
 
+# ---- INT2 quantization ----
+
+
+def per_channel_int2(
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    scale_max: float = 2.0,
+    smooth_v: bool = True
+):
+    """
+    Quantize tensor `v` to int2 precision with per-channel quantization.
+    INT2 values are stored in INT8 containers (one per byte, no packing)
+    so the existing INT8 attention kernel can be reused.
+
+    The signed-symmetric range is [-2, 1]; ``scale_max`` defaults to 2.0
+    because the largest absolute value representable is 2.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        The input tensor. Shape:
+        - If `tensor_layout` is "HND": ``[batch_size, num_kv_heads, kv_len, head_dim]``.
+        - If `tensor_layout` is "NHD": ``[batch_size, kv_len, num_kv_heads, head_dim]``.
+        Dtype: torch.float16 or torch.bfloat16.
+
+    tensor_layout : str
+        The tensor layout, either "HND" or "NHD".  Default: "HND".
+
+    scale_max : float
+        The maximum absolute value representable by the quantization.
+        Default: 2.0 (signed 2-bit, values in [-2, 1]).
+
+    smooth_v : bool
+        Whether to subtract the per-channel mean before quantization.
+        Default: True.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        - v_int2: ``int8`` dtype, same shape as ``v`` (values clamped to [-2, 1]).
+        - scale: ``float32``, shape ``[batch_size, num_kv_heads, head_dim]``.
+        - mean:  ``float32``, shape ``[batch_size, num_kv_heads, head_dim]``
+          (``None`` when ``smooth_v=False``).
+    """
+    assert tensor_layout in ["HND", "NHD"], f"Unsupported tensor layout: {tensor_layout}"
+    assert v.dtype in [torch.float16, torch.bfloat16], f"Unsupported dtype: {v.dtype}"
+
+    orig_shape = v.shape
+    batch_size = orig_shape[0]
+    head_dim = orig_shape[-1]
+
+    if tensor_layout == "HND":
+        num_kv_heads = orig_shape[1]
+        kv_len = orig_shape[2]
+        v_reshaped = v.view(batch_size * num_kv_heads, kv_len, head_dim)
+    else:
+        kv_len = orig_shape[1]
+        num_kv_heads = orig_shape[2]
+        v_reshaped = v.permute(0, 2, 1, 3).reshape(batch_size * num_kv_heads, kv_len, head_dim)
+
+    v_quant, scale, mean = _per_channel_int2_triton(v_reshaped, scale_max, smooth_v)
+
+    if tensor_layout == "HND":
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    else:
+        v_quant = v_quant.view(batch_size, num_kv_heads, kv_len, head_dim).permute(0, 2, 1, 3)
+        scale = scale.view(batch_size, num_kv_heads, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+
+    return v_quant, scale, mean
+
+
+@triton.jit
+def _apply_quant_int2_kernel(
+    V_ptr, Quant_ptr, Scale_ptr, Mean_ptr,
+    B, M, D,
+    stride_vb, stride_vm, stride_vd,
+    stride_qb, stride_qm, stride_qd,
+    SMOOTH_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Quantize V to INT2 range [-2, 1] and store in INT8 containers.
+    """
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    b_offsets = pid_b
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    m_mask = m_offsets < M
+    d_mask = d_offsets < D
+
+    v_ptrs = V_ptr + b_offsets * stride_vb + m_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+    v = tl.load(v_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+
+    scale_ptrs = Scale_ptr + b_offsets * D + d_offsets
+    scale = tl.load(scale_ptrs, mask=d_mask, other=1.0)
+
+    if SMOOTH_V:
+        mean_ptrs = Mean_ptr + b_offsets * D + d_offsets
+        mean = tl.load(mean_ptrs, mask=d_mask, other=0.0)
+        v = v - mean[None, :]
+
+    q = v / scale[None, :]
+    q += 0.5 * tl.where(q >= 0, 1.0, -1.0)
+    q_int = q.to(tl.int32)
+    q_int = tl.where(q_int > 1, 1, tl.where(q_int < -2, -2, q_int))
+
+    q_ptrs = Quant_ptr + b_offsets * stride_qb + m_offsets[:, None] * stride_qm + d_offsets[None, :] * stride_qd
+    tl.store(q_ptrs, q_int.to(tl.int8), mask=m_mask[:, None] & d_mask[None, :])
+
+
+def _per_channel_int2_triton(v: torch.Tensor, scale_max: float, smooth_v: bool):
+    """Triton-based per-channel INT2 quantization (stored in int8 containers)."""
+    v = v.contiguous()
+    B, M, D = v.shape
+
+    scale = torch.empty((B, D), dtype=torch.float32, device=v.device)
+    mean = torch.empty((B, D), dtype=torch.float32, device=v.device) if smooth_v else None
+    v_quant = torch.empty_like(v, dtype=torch.int8)
+
+    BLOCK_M_1 = 1024
+    BLOCK_D_1 = triton.next_power_of_2(D) if D <= 64 else 64
+    grid_1 = (B, triton.cdiv(D, BLOCK_D_1))
+
+    dummy_mean = mean if smooth_v else scale
+
+    _get_stats_kernel[grid_1](
+        v, scale, dummy_mean,
+        B, M, D,
+        v.stride(0), v.stride(1), v.stride(2),
+        SCALE_MAX=scale_max,
+        SMOOTH_V=smooth_v,
+        BLOCK_M=BLOCK_M_1,
+        BLOCK_D=BLOCK_D_1,
+    )
+
+    BLOCK_M_2 = 128
+    BLOCK_D_2 = BLOCK_D_1
+    grid_2 = (B, triton.cdiv(M, BLOCK_M_2), triton.cdiv(D, BLOCK_D_2))
+
+    _apply_quant_int2_kernel[grid_2](
+        v, v_quant, scale, dummy_mean,
+        B, M, D,
+        v.stride(0), v.stride(1), v.stride(2),
+        v_quant.stride(0), v_quant.stride(1), v_quant.stride(2),
+        SMOOTH_V=smooth_v,
+        BLOCK_M=BLOCK_M_2,
+        BLOCK_D=BLOCK_D_2,
+    )
+
+    return v_quant, scale, mean if smooth_v else None
+
+
 # ---- INT4 quantization ----
 
 def per_channel_int4(
@@ -423,3 +585,165 @@ def _per_channel_int4_triton(v: torch.Tensor, scale_max: float, smooth_v: bool):
     )
 
     return v_quant, scale, mean if smooth_v else None
+
+
+# ---- Block-scaled V quantization ----
+
+
+def per_channel_block_intx(
+    v: torch.Tensor,
+    bits: int,
+    tensor_layout: str = "HND",
+    block_size: int = 64,
+    smooth_v: bool = True,
+    asymmetric: bool = False,
+):
+    """
+    Quantize tensor `v` to ``bits``-bit signed integers with per-channel-
+    per-block scaling along the sequence (KV) dimension.
+
+    This is the software-emulated MXINTx / block-scaled INTx format for V.
+    Each channel is split into non-overlapping blocks of ``block_size`` tokens;
+    every block gets its own scale, so the quantizer can adapt to local
+    magnitude variations and improve accuracy at very low bit widths (e.g. INT2).
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Input tensor. Shape:
+        - HND: ``[batch_size, num_kv_heads, kv_len, head_dim]``.
+        - NHD: ``[batch_size, kv_len, num_kv_heads, head_dim]``.
+    bits : int
+        Target bit width. Supported: 2, 4, 8.
+    tensor_layout : str
+        "HND" or "NHD". Default: "HND".
+    block_size : int
+        Sequence block size for the per-block scale. Default: 64.
+    smooth_v : bool
+        Whether to subtract the per-channel mean (computed over the whole
+        sequence) before block-wise quantization. Default: True.
+    asymmetric : bool
+        If True, use unsigned integer grid with a per-block zero-point
+        (scale+zero-point), which usually improves accuracy over symmetric
+        signed quantization at very low bit widths. Default: False.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        - v_quant: int8 containers, same shape as ``v``.
+        - scale: ``[batch_size, num_kv_heads, num_blocks, head_dim]`` float32.
+        - zp: ``[batch_size, num_kv_heads, num_blocks, head_dim]`` int8
+          (only returned when ``asymmetric=True``).
+        - mean: ``[batch_size, num_kv_heads, head_dim]`` float32 (None if smooth_v=False).
+    """
+    assert tensor_layout in ["HND", "NHD"]
+    assert v.dtype in [torch.float16, torch.bfloat16]
+    assert bits in [2, 4, 8], f"Unsupported bits: {bits}"
+
+    if asymmetric:
+        # Unsigned grid [0, 2^bits - 1] with per-block zero-point.
+        scale_max = 0.0  # unused in asymmetric branch
+        qmin, qmax = 0, (1 << bits) - 1
+    else:
+        # Signed symmetric range [-2^(bits-1), 2^(bits-1)-1]
+        if bits == 2:
+            scale_max = 2.0
+            qmin, qmax = -2, 1
+        elif bits == 4:
+            scale_max = 7.0
+            qmin, qmax = -8, 7
+        else:  # bits == 8
+            scale_max = 127.0
+            qmin, qmax = -127, 127
+
+    orig_shape = v.shape
+    batch_size = orig_shape[0]
+    head_dim = orig_shape[-1]
+
+    if tensor_layout == "HND":
+        num_kv_heads = orig_shape[1]
+        kv_len = orig_shape[2]
+        v_reshaped = v.view(batch_size * num_kv_heads, kv_len, head_dim)
+    else:
+        kv_len = orig_shape[1]
+        num_kv_heads = orig_shape[2]
+        v_reshaped = v.permute(0, 2, 1, 3).reshape(batch_size * num_kv_heads, kv_len, head_dim)
+
+    B, M, D = v_reshaped.shape
+    pad_len = (block_size - M % block_size) % block_size
+    if pad_len:
+        v_padded = torch.nn.functional.pad(v_reshaped, (0, 0, 0, pad_len))
+    else:
+        v_padded = v_reshaped
+    M_padded = v_padded.shape[1]
+    num_blocks = M_padded // block_size
+
+    # Per-channel mean (global over sequence) for smooth_v
+    if smooth_v:
+        mean = v_reshaped.mean(dim=1, keepdim=True)  # [B, 1, D]
+        v_centered = v_padded - mean
+    else:
+        mean = None
+        v_centered = v_padded
+
+    # Reshape to blocks: [B, num_blocks, block_size, D]
+    v_blocks = v_centered.view(B, num_blocks, block_size, D)
+
+    if asymmetric:
+        bmin = v_blocks.amin(dim=2)  # [B, num_blocks, D]
+        bmax = v_blocks.amax(dim=2)
+        scale = (bmax - bmin) / (qmax - qmin)
+        scale = scale.clamp_min(1e-9)
+        zp = torch.round(-bmin / scale).clamp(qmin, qmax).to(torch.int8)  # [B, num_blocks, D]
+        q = torch.round(v_blocks / scale.unsqueeze(2)) + zp.unsqueeze(2)
+    else:
+        # Per-block scale: [B, num_blocks, D]
+        max_abs = v_blocks.abs().amax(dim=2)
+        scale = max_abs / scale_max
+        scale = scale.clamp_min(1e-9)
+        zp = None
+        q = v_blocks / scale.unsqueeze(2)
+
+    q = torch.round(q).clamp(qmin, qmax)
+    v_quant_blocks = q.to(torch.int8)
+
+    # Reshape back to [B, M_padded, D] and trim padding
+    v_quant_padded = v_quant_blocks.view(B, M_padded, D)
+    if pad_len:
+        v_quant_padded = v_quant_padded[:, :M, :]
+
+    # Reshape back to original layout
+    if tensor_layout == "HND":
+        v_quant = v_quant_padded.view(batch_size, num_kv_heads, kv_len, head_dim)
+        scale = scale.view(batch_size, num_kv_heads, num_blocks, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+    else:
+        v_quant = v_quant_padded.view(batch_size, num_kv_heads, kv_len, head_dim).permute(0, 2, 1, 3)
+        scale = scale.view(batch_size, num_kv_heads, num_blocks, head_dim)
+        if smooth_v:
+            mean = mean.view(batch_size, num_kv_heads, head_dim)
+
+    if asymmetric:
+        assert zp is not None, "zp must be computed in asymmetric mode"
+        zp = zp.view(batch_size, num_kv_heads, num_blocks, head_dim)
+        return v_quant, scale, zp, mean
+    return v_quant, scale, mean
+
+
+def per_channel_int2_block(v, tensor_layout="HND", block_size=64, smooth_v=True):
+    """Convenience wrapper for 2-bit block-scaled V quantization (MXINT2)."""
+    return per_channel_block_intx(v, bits=2, tensor_layout=tensor_layout,
+                                  block_size=block_size, smooth_v=smooth_v)
+
+
+def per_channel_int4_block(v, tensor_layout="HND", block_size=64, smooth_v=True):
+    """Convenience wrapper for 4-bit block-scaled V quantization (MXINT4)."""
+    return per_channel_block_intx(v, bits=4, tensor_layout=tensor_layout,
+                                  block_size=block_size, smooth_v=smooth_v)
+
+
+def per_channel_int8_block(v, tensor_layout="HND", block_size=64, smooth_v=True):
+    """Convenience wrapper for 8-bit block-scaled V quantization (MXINT8)."""
+    return per_channel_block_intx(v, bits=8, tensor_layout=tensor_layout,
+                                  block_size=block_size, smooth_v=smooth_v)

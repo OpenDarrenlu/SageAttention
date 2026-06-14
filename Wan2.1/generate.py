@@ -162,6 +162,28 @@ def _parse_args():
         default=False,
         help="Whether to use lut attention.")
     parser.add_argument(
+        "--p_quant_dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "bf16", "int8", "int4", "mxfp8", "mxfp4", "nvfp4", "mxint4"],
+        help="Precision for online P quantization when --use_lut is set.")
+    parser.add_argument(
+        "--v_quant_dtype",
+        type=str,
+        default="int8",
+        choices=["int8", "int4", "int2"],
+        help="Precision for per-channel V quantization when --use_lut is set.")
+    parser.add_argument(
+        "--p_block_n",
+        type=int,
+        default=64,
+        help="Block size for P scaling along KV dim when --use_lut is set. Must divide 64.")
+    parser.add_argument(
+        "--v_block_size",
+        type=int,
+        default=0,
+        help="Block size for V scaling along KV dim when --use_lut is set. 0=per-channel, 64=per-block (MXINTx).")
+    parser.add_argument(
         "--use_p_codebook",
         action="store_true",
         default=False,
@@ -385,6 +407,10 @@ def generate(args):
             use_delSubnorm=args.use_delSubnorm,
             use_lut=args.use_lut,
             use_p_codebook=args.use_p_codebook,
+            p_quant_dtype=args.p_quant_dtype,
+            v_quant_dtype=args.v_quant_dtype,
+            p_block_n=args.p_block_n,
+            v_block_size=args.v_block_size,
         )
 
         logging.info(
@@ -580,7 +606,13 @@ def generate(args):
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            # Embed P/V precision and block sizes in filename when --use_lut is active
+            if args.use_lut:
+                v_block_tag = f"vb{args.v_block_size}" if args.v_block_size > 0 else "vperch"
+                precision_tag = f"P{args.p_quant_dtype}_V{args.v_quant_dtype}_{v_block_tag}_pb{args.p_block_n}"
+            else:
+                precision_tag = "default"
+            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{precision_tag}_{formatted_prompt}_{formatted_time}" + suffix
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")
