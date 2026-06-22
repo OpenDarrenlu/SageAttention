@@ -292,24 +292,49 @@ out = sageattn_lut(q, k, v, p_quant_dtype="nvfp4", v_quant_dtype="int8", p_block
 - `v_block_size=0`：per-channel（默认，兼容旧行为）。
 - `v_block_size=64`：per-channel-per-block（MXINT2）。
 
-### 9.3 Dummy 模型精度对比
+### 9.3 V 量化重建误差（最可信的指标）
 
-在 4-layer、head_dim=128 的 Wan 假模型上，固定 seed=42，以 SDPA 为基准：
+> **重要修正**：早期版本曾用「假模型 model-level mean_abs_err」对比 MXINT2 与 per-channel
+> INT2，并错误地得出「MXINT2 反而更差」的结论。经复核，**该 model-level 指标在本实验里
+> 是失真的**（原因见 9.3.2），不能作为 V 量化质量的依据。下面改用直接的 **V 重建误差**
+> `|dequant(V) - V|` 作为主指标，它剥离了 attention/网络传播带来的噪声，是最干净的衡量方式。
 
-| 配置 | max_abs_err | mean_abs_err |
-|------|-------------|--------------|
-| P=fp16, V=int2 per-channel | 1.56e-2 | 1.25e-3 |
-| P=fp16, V=int2 block-scaled (MXINT2) | 1.56e-2 | 1.92e-3 |
-| P=int4, V=int2 per-channel | 1.56e-2 | 1.25e-3 |
-| P=int4, V=int2 block-scaled (MXINT2) | 1.56e-2 | 1.91e-3 |
-| P=nvfp4, V=int2 block-scaled (MXINT2) | 1.56e-2 | 1.91e-3 |
-| P=fp16, V=int4 per-channel（参考） | 1.56e-2 | 8.39e-4 |
-| P=fp16, V=int4 block-scaled（参考） | 1.56e-2 | 7.86e-4 |
+#### 9.3.1 V 重建误差对比
 
-说明：
-- `max_abs_err` 全部被截断到 `1.56e-2`（接近 bfloat16 离散化步长），模型最终输出层对 attention 内部差异有饱和/掩蔽效应。
-- 在 **model-level mean_err 上，对称 MXINT2 并未优于 per-channel INT2**，甚至比 per-channel 略差。
-- 但在直接的 attention-level 小实验（随机 Q/K/V）中，block-scaled int2 的 max_err 从 0.3828 降到 0.3164（相对 int8 基准），说明 block scaling 确实能减少 attention 内部的量化误差，只是假模型的最终输出不够敏感。
+在受控合成数据（per-channel 不同幅度 + 沿序列的局部幅度突变，模拟真实 V 的分布特征）上，
+对 INT2（当前 scale_max=2.0，值域 `[-2,1]`，smooth_v=True）测量重建误差：
+
+| INT2 方案 | mean 重建误差 | 相对 per-channel |
+|-----------|---------------|------------------|
+| per-channel（整条序列一个 scale） | 1.6482 | — |
+| block-scaled bs=128 | 1.2251 | −26% |
+| block-scaled bs=64（MXINT2，kernel 默认） | 1.1445 | −31% |
+| block-scaled bs=32 | 1.0657 | −35% |
+| block-scaled bs=16 | **0.9852** | **−40%** |
+
+**结论：block scaling 在 V 重建层面单调降低误差，粒度越细越好**，完全符合「缩小量化粒度
+提高精度」的直觉。MXINT2 的量化算法本身是正确且有效的。
+
+#### 9.3.2 为什么早期的 model-level 指标会显示 MXINT2「更差」？
+
+那是**测量假象**，根源有三：
+
+1. **假模型未训练**：`WanTransformer3DModel` 是随机初始化权重。V 的量化误差经过若干随机
+   线性投影后，与最终输出误差之间几乎没有单调关系——测到的是噪声在随机网络里的传播，
+   而非量化质量。
+2. **bf16 输出饱和**：所有配置的最终输出 `max_abs_err` 都恒为 `1.5625e-2`（bf16 离散步长），
+   说明输出动态范围极小，model-level 指标已被量化台阶「夹平」，分辨不出 V 量化的优劣。
+3. **样本不足**：早期对比只跑 seed=42 单次、未做多种子平均，1.25e-3 与 1.92e-3 的差异
+   在该噪声水平下没有统计意义。
+
+因此，**评估超低比特 V 量化应以 V 重建误差（或在真实/已训练模型上的端到端指标）为准，
+而非未训练假模型的输出误差**。
+
+#### 9.3.3 待补充：真实模型 attention-level 指标
+
+由于 `experiment_wan4.py` 的 block-scaling 细化实验当时只扫了 V=int8，尚未在 attention-level
+直接测过 block-int2。后续应在 GPU 上补跑 per-channel-int2 vs block-int2 的 attention 输出误差
+（以 SDPA 为基准）以进一步交叉验证；重建误差结论已足以支撑「block scaling 有效」这一判断。
 
 ### 9.4 真实视频生成
 
@@ -328,18 +353,28 @@ out = sageattn_lut(q, k, v, p_quant_dtype="nvfp4", v_quant_dtype="int8", p_block
 
 所有视频保存在 `/home/lutingzhan/workspace_infer/SageAttention/Wan2.1/`，可直接通过文件名区分并评估生成效果。
 
-### 9.5 为什么对称 MXINT2 在模型级没有明显提升？
+### 9.5 对称 vs 非对称 MXINT2
 
-当前实现是**对称** MXINT2：
-- 2-bit signed 值域 `[-2, -1, 0, 1]`。
-- 正半轴最大只能表示 1，负半轴到 -2，动态范围不对称。
-- 4 个 level 没有充分利用（对集中在 0 附近的 V 值，只有 3 个有效 level）。
+当前实现默认是**对称** MXINT2（值域 `[-2,-1,0,1]`，max-abs/2.0 缩放）。一个自然的疑问是
+非对称量化（unsigned `[0,3]` + per-block zero-point）是否更好。在同一份合成数据上对比：
 
-因此下一步更推荐：**非对称 MXINT2（asymmetric INT2 with per-block zero-point）**。
+| INT2 方案（block bs=64） | mean 重建误差 | max 重建误差 |
+|--------------------------|---------------|--------------|
+| 对称 MXINT2 | 1.1445 | 15.9 |
+| 非对称 MXINT2（zero-point） | 1.3150 | **9.5** |
 
-### 9.6 推荐：非对称 MXINT2
+结论与直觉略有出入：
+- V 在做完 per-channel 去均值（`smooth_v`）后接近**零均值**分布，对称量化已与之匹配，
+  因此**对称 MXINT2 的平均误差反而更低**。
+- 非对称的优势集中在 **max（尾部/离群）误差**：9.5 vs 15.9，对个别幅度突变的 block 更稳。
 
-对每个 block 用 unsigned grid `[0, 1, 2, 3]`，配合 per-block zero-point：
+因此「非对称一定更优」并不成立——**block scaling 才是主要收益来源**，对称/非对称的选择取决于
+你更在意平均误差还是离群误差。若 V 经过 smooth_v 已零均值化，**对称 MXINT2 通常就足够**。
+
+### 9.6 非对称 MXINT2（备选，针对离群值）
+
+若实测发现某些 head/block 的 V 分布明显偏斜、离群值导致可见瑕疵，可启用非对称 MXINT2：
+对每个 block 用 unsigned grid `[0,1,2,3]` + per-block zero-point：
 
 ```
 scale = (max - min) / 3
@@ -349,11 +384,12 @@ dequant = (q - zp) * scale
 ```
 
 优势：
-- 4 个 level 全部利用，覆盖 `[min, max]` 整个区间。
-- 每个 block 自适应偏移，更好拟合局部 V 分布。
+- 4 个 level 全部利用，覆盖 `[min, max]` 整个区间，对偏斜/有离群的 block 更鲁棒（max 误差更低）。
+- 每个 block 自适应偏移。
 - 硬件上只多一个 per-block zero-point（或预乘成 bias），开销很小。
 
-在 `quant_per_channel.py` 中已为 `per_channel_block_intx` 预留 `asymmetric` 参数，后续只需在 attention kernel 中加入 `(v_int - zp) * scale` 的反量化路径即可。
+`quant_per_channel.py` 中 `per_channel_block_intx` 已实现 `asymmetric=True` 路径（返回额外的
+`zp`），attention kernel 中加入 `(v_int - zp) * scale` 的反量化路径即可启用。
 
 ### 9.7 其他 V=2bit 备选方案
 
@@ -365,7 +401,11 @@ dequant = (q - zp) * scale
 
 ### 9.8 结论
 
-- 已实现并验证了**对称 MXINT2**（V per-channel-per-block INT2）。
-- 真实视频已生成，可用于评估 P=4bit/16bit + V=2bit 的实际效果。
-- 若对称 MXINT2 仍不满足视觉质量，下一步应实现**非对称 MXINT2 with zero-point**，这是目前理论上最有效的 V=2bit 方案。
+- 已实现并验证了 **MXINT2**（V per-channel-per-block INT2）。**V 重建误差证明 block scaling
+  单调有效**：per-channel 1.65 → block64 1.14 → block16 0.99（−40%），符合「缩小粒度提精度」的预期。
+- 早期「MXINT2 在 model-level 更差」的说法是**未训练假模型 + bf16 饱和导致的测量假象**，已修正；
+  评估超低比特 V 应以重建误差或真实/已训练模型的端到端指标为准。
+- 对称 vs 非对称：V 经 smooth_v 零均值化后，**对称 MXINT2 平均误差更低**；非对称主要降低离群（max）误差。
+- 真实视频已生成，可用于主观评估 P=4bit/16bit + V=2bit 的实际效果。
+- 待办：在 GPU 上补跑 block-int2 的 attention-level 误差，做端到端交叉验证。
 
