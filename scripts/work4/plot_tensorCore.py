@@ -131,11 +131,11 @@ fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor='#3d6b00')
 
 # Row 0: Single Cycle
 plot_panel(axes[0, 0], "HMMA Single Cycle\n(M=8, N=4, K=8)", (8, 8), (8, 4), (8, 4))
-plot_panel(axes[0, 1], "LMMA Single Cycle\n(M=8, N=64, K=8)", (8, 8), (8, 64), (8, 64))
+plot_panel(axes[0, 1], "LMMA Single Cycle(1bit)\n(M=8, N=64, K=8)", (8, 8), (8, 64), (8, 64))
 
 # Row 1: 8 Cycles
 plot_panel(axes[1, 0], "HMMA 8 Cycles\n(M=16, N=8, K=16)", (16, 16), (16, 8), (16, 8))
-plot_panel(axes[1, 1], "LMMA 8 Cycles\n(M=16, N=128, K=16)", (16, 16), (16, 128), (16, 128))
+plot_panel(axes[1, 1], "LMMA 8 Cycles(4bit)\n(M=16, N=64, K=8)", (16, 8), (8, 64), (16, 64))
 
 # Side labels
 fig.text(0.015, 0.73, 'Single Cycle\n(Instruction Shape)', va='center', ha='center',
